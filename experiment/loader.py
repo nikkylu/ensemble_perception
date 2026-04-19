@@ -198,7 +198,7 @@ def extract(model, dataloader, device, n_layers=N_LAYERS):
         all_patches — mean-pooled all patches (naive baseline)
     """
     # accumulators — one list per slice type
-    all_cls, all_bar, all_bg, all_avg, all_bar_concat = [], [], [], [], []
+    all_cls, all_bar, all_bg, all_avg, all_bar_concat, all_bg_concat = [], [], [], [], [], []
     all_label_mean, all_label_var, all_n_bars, all_filenames = [], [], [], []
 
     for images, masks, label_means, label_vars, n_bars, filenames in dataloader:
@@ -215,6 +215,7 @@ def extract(model, dataloader, device, n_layers=N_LAYERS):
         bg_per_layer = []
         avg_per_layer = []
         bar_concat_per_layer = []
+        bg_concat_per_layer = []
 
         for patch_tokens, cls_token in layer_outputs:
             patch_tokens = patch_tokens.cpu()   # (B, 256, 768)
@@ -232,6 +233,10 @@ def extract(model, dataloader, device, n_layers=N_LAYERS):
             concat = masked_concat(patch_tokens, masks)
             bar_concat_per_layer.append(concat)
 
+            # concatenated bg patches (only works when all images have same n_bars)
+            bg_concat = masked_concat(patch_tokens, ~masks)
+            bg_concat_per_layer.append(bg_concat)
+
         # stack layers: list of 12 x (B, 768) -> (12, B, 768) -> (B, 12, 768)
         all_cls.append(torch.stack(cls_per_layer).permute(1, 0, 2))
         all_bar.append(torch.stack(bar_per_layer).permute(1, 0, 2))
@@ -242,6 +247,11 @@ def extract(model, dataloader, device, n_layers=N_LAYERS):
         if all(c is not None for c in bar_concat_per_layer):
             all_bar_concat.append(torch.stack(
                 bar_concat_per_layer).permute(1, 0, 2))
+
+        # bg_concat: same logic, using background patches
+        if all(c is not None for c in bg_concat_per_layer):
+            all_bg_concat.append(torch.stack(
+                bg_concat_per_layer).permute(1, 0, 2))
 
         # accumulate labels
         all_label_mean.append(label_means)
@@ -261,13 +271,20 @@ def extract(model, dataloader, device, n_layers=N_LAYERS):
         "filenames":    all_filenames,
     }
 
-    # bar_concat only available when all images have same n_bars
+    # bar_concat / bg_concat only available when all images have same n_bars
     if all_bar_concat:
         dims = [t.shape[-1] for t in all_bar_concat]
-    if len(set(dims)) == 1:
-        output["bar_concat"] = torch.cat(all_bar_concat)
-    else:
-        print("  bar_concat skipped (inconsistent patch counts)")
+        if len(set(dims)) == 1:
+            output["bar_concat"] = torch.cat(all_bar_concat)
+        else:
+            print("  bar_concat skipped (inconsistent patch counts)")
+
+    if all_bg_concat:
+        dims = [t.shape[-1] for t in all_bg_concat]
+        if len(set(dims)) == 1:
+            output["bg_concat"] = torch.cat(all_bg_concat)
+        else:
+            print("  bg_concat skipped (inconsistent patch counts)")
 
     return output
 

@@ -142,7 +142,8 @@ def compute_pairwise_diff(bar_concat, n_bars):
     pairs = []
     for i in range(n_bars):
         for j in range(i + 1, n_bars):
-            diff = (tokens[:, :, i, :] - tokens[:, :, j, :]) ** 2  # (N, L, 768)
+            diff = (tokens[:, :, i, :] -
+                    tokens[:, :, j, :]) ** 2  # (N, L, 768)
             pairs.append(diff)
     return torch.stack(pairs).mean(0)  # (N, L, 768)
 
@@ -186,7 +187,7 @@ def sweep(features, target, n_bars_filter=None, n_folds=5, lr=1e-3, epochs=200, 
         f"Class distribution: {[int((y == c).sum()) for c in range(n_classes)]}")
     print()
 
-    # include bar_concat and pairwise_diff if available
+    # include bar_concat, bg_concat, and pairwise_diff if available
     slice_types = list(SLICE_TYPES)
     extra_features = {}
     if "bar_concat" in features:
@@ -196,6 +197,8 @@ def sweep(features, target, n_bars_filter=None, n_folds=5, lr=1e-3, epochs=200, 
                 features["bar_concat"][indices], n_bars_filter
             )
             slice_types.append("pairwise_diff")
+    if "bg_concat" in features:
+        slice_types.append("bg_concat")
 
     results = {}
 
