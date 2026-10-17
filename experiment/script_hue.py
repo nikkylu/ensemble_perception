@@ -4,7 +4,7 @@ Hue ensemble stimuli generator.
 Each stimulus contains N circles placed one-per-patch on a 224px canvas.
 Circle hues are sampled from a von Mises distribution (circular) in HSV
 space around a mean hue, with fixed saturation and value.
-Background is picked from a color bank with sufficient contrast to circles.
+Background is picked at random from black / gray / white (achromatic).
 
 Ground truth stored per trial:
   - mean_hue, variance_hue       : condition labels (degrees, 0-360)
@@ -40,11 +40,9 @@ CIRCLE_VALUE = 0.90
 # fits within 14px patch (diameter=10, margin=2px each side)
 CIRCLE_RADIUS_PX = 5
 
-# Background color bank — same saturation/value as circles, picked for contrast
-N_BG_COLORS = 15
-BG_SATURATION = 0.5
-BG_VALUE = CIRCLE_VALUE
-MIN_CONTRAST_RATIO = 6.0
+# Background colors — achromatic (S=0), so the background carries no hue
+BG_NAMES = ["black", "gray", "white"]
+BG_COLORS = [(0.0, 0.0, 0.0), (0.5, 0.5, 0.5), (1.0, 1.0, 1.0)]
 
 # Display geometry
 CANVAS_SIZE = 224
@@ -52,13 +50,12 @@ PATCH_PX = 14
 JITTER_REGION = 0.85
 
 # Appearance
-FIXATION = True
+FIXATION = False           # no fixation cross — keeps center patches clean
 FIX_SIZE = 4
-FIX_COLOR = (0.3, 0.3, 0.3)
 DPI = 72
 
 # Output
-OUTPUT_DIR = Path("stimuli_hue_v1")
+OUTPUT_DIR = Path("stimuli_hue_v2")
 SAVE_METADATA = True
 SEED = 42
 
@@ -67,38 +64,19 @@ SEED = 42
 # COLOR UTILITIES
 # ─────────────────────────────────────────────────────────────────
 
-def relative_luminance(rgb: tuple) -> float:
-    def linearize(c):
-        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
-    r, g, b = [linearize(c) for c in rgb]
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
-
-
-def contrast_ratio(a: tuple, b: tuple) -> float:
-    la, lb = relative_luminance(a), relative_luminance(b)
-    lighter, darker = max(la, lb), min(la, lb)
-    return (lighter + 0.05) / (darker + 0.05)
-
-
 def hue_to_rgb(hue_deg: float, saturation: float, value: float) -> tuple:
     """Convert HSV (hue in degrees 0-360) to RGB tuple."""
     h = (hue_deg % 360) / 360.0
     return tuple(mcolors.hsv_to_rgb([h, saturation, value]))
 
 
-def build_color_bank(n: int) -> list:
-    """N evenly-spaced fully-saturated colors around the hue wheel."""
-    hues = np.linspace(0, 1, n, endpoint=False)
-    return [tuple(mcolors.hsv_to_rgb([h, BG_SATURATION, BG_VALUE])) for h in hues]
-
-
-def pick_bg_color(color_bank: list, rng: np.random.Generator) -> tuple:
+def pick_bg_color(rng: np.random.Generator) -> tuple:
     """
-    Pick a random background color from the bank independently of circle hues.
+    Pick a random achromatic background independently of circle hues.
     No conditioning on mean hue — avoids systematic color-condition correlation.
     """
-    idx = rng.integers(len(color_bank))
-    return color_bank[idx], idx
+    idx = int(rng.integers(len(BG_COLORS)))
+    return BG_COLORS[idx], idx
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -199,11 +177,13 @@ def render_stimulus(positions: np.ndarray, hues_deg: np.ndarray,
         ax.add_patch(circle)
 
     if FIXATION:
+        # keep the cross visible on any achromatic background
+        fix_color = (0.75,) * 3 if np.mean(bg_color) < 0.25 else (0.25,) * 3
         cx, cy = canvas_size / 2, canvas_size / 2
         ax.plot([cx - FIX_SIZE, cx + FIX_SIZE], [cy, cy],
-                color=FIX_COLOR, linewidth=1)
+                color=fix_color, linewidth=1)
         ax.plot([cx, cx], [cy - FIX_SIZE, cy + FIX_SIZE],
-                color=FIX_COLOR, linewidth=1)
+                color=fix_color, linewidth=1)
 
     plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
@@ -220,7 +200,7 @@ def render_stimulus(positions: np.ndarray, hues_deg: np.ndarray,
 # EXAMPLE GRID
 # ─────────────────────────────────────────────────────────────────
 
-def render_example_grid(n_circles: int, bg_bank: list, rng: np.random.Generator):
+def render_example_grid(n_circles: int, rng: np.random.Generator):
     n_means = len(HUE_MEANS)
     n_vars = len(HUE_VARIANCES)
     fig, axes = plt.subplots(n_vars, n_means,
@@ -236,7 +216,7 @@ def render_example_grid(n_circles: int, bg_bank: list, rng: np.random.Generator)
             hues = sample_hues(mean_hue, var_hue, n_circles, rng)
             positions = place_circles(
                 n_circles, CANVAS_SIZE, JITTER_REGION, rng)
-            bg_color, _ = pick_bg_color(bg_bank, rng)
+            bg_color, _ = pick_bg_color(rng)
 
             ax.set_xlim(0, CANVAS_SIZE)
             ax.set_ylim(CANVAS_SIZE, 0)
@@ -273,8 +253,6 @@ def generate_all():
     rng = np.random.default_rng(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    bg_bank = build_color_bank(N_BG_COLORS)
-
     print(f"Hue stimuli generator")
     print(f"  HUE_MEANS:      {HUE_MEANS}")
     print(f"  HUE_VARIANCES:  {HUE_VARIANCES}")
@@ -301,7 +279,7 @@ def generate_all():
             positions = place_circles(
                 n_circles, CANVAS_SIZE, JITTER_REGION, rng)
 
-            bg_color, bg_idx = pick_bg_color(bg_bank, rng)
+            bg_color, bg_idx = pick_bg_color(rng)
 
             fname = (f"stim_n{n_circles:02d}_mean{mean_hue:03d}"
                      f"_var{var_hue:03d}_rep{rep:02d}.png")
@@ -320,6 +298,7 @@ def generate_all():
                 "variance_hue":          float(var_hue),
                 "repetition":            rep,
                 "bg_color_idx":          int(bg_idx),
+                "bg_color_name":         BG_NAMES[bg_idx],
                 "bg_color_rgb":          list(bg_color),
                 "hues":                  hues.tolist(),
                 "positions_x":           positions[:, 0].tolist(),
@@ -335,8 +314,9 @@ def generate_all():
 
     if SAVE_METADATA:
         bg_bank_serialized = [
-            {"index": i, "rgb": list(c), "hex": mcolors.to_hex(c)}
-            for i, c in enumerate(bg_bank)
+            {"index": i, "name": BG_NAMES[i], "rgb": list(c),
+             "hex": mcolors.to_hex(c)}
+            for i, c in enumerate(BG_COLORS)
         ]
         meta_path = OUTPUT_DIR / "metadata.json"
         with open(meta_path, "w") as f:
@@ -353,7 +333,7 @@ def generate_all():
                     "circle_saturation": CIRCLE_SATURATION,
                     "circle_value":    CIRCLE_VALUE,
                     "jitter_region":   JITTER_REGION,
-                    "n_bg_colors":     N_BG_COLORS,
+                    "bg_colors":       BG_NAMES,
                     "seed":            SEED,
                 },
                 "bg_bank": bg_bank_serialized,
@@ -364,7 +344,7 @@ def generate_all():
     # Example grids
     print("\nRendering example grids...")
     for n_circles in N_CIRCLES_LIST:
-        render_example_grid(n_circles, bg_bank,
+        render_example_grid(n_circles,
                             np.random.default_rng(SEED + 999 + n_circles))
 
     print(f"\nDone. {count} stimuli in {OUTPUT_DIR.resolve()}")
