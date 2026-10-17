@@ -39,13 +39,13 @@ MIN_SPACING = 14           # Chebyshev distance: max(|Δx|,|Δy|) >= 1 patch
 JITTER_REGION = 0.85       # fraction of canvas used for placement
 
 # Appearance
-FIXATION = True
+FIXATION = False           # no fixation cross — keeps center patches clean
 FIX_SIZE = 4
 FIX_COLOR = (0.3, 0.3, 0.3)
 DPI = 72                   # at 72 DPI, 224px canvas = ~3.1 inches
 
 # Output
-OUTPUT_DIR = Path("stimuli_v3")
+OUTPUT_DIR = Path("stimuli_v4")
 SAVE_METADATA = True
 
 # Random seed
