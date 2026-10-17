@@ -48,11 +48,12 @@ Saves `verify_mask.png` showing the 16×16 patch grid aligned to the image with 
 ### 4. Probe
 
 ```bash
-# single run
-python3 probe.py --features featuresv3/features_n16.pt --target variance --n_bars 16 --probe linear
-python3 probe.py --features featuresv3/features_n16.pt --target variance --n_bars 16 --probe quadratic
+# full protocol: fixes the nuisance variable at each level and averages
+# (target mean → fix variance per level; target variance → fix mean per level)
+python3 experiment/probe.py --features featuresv3/features_n16.pt --target mean --n_bars 16 --probe linear
+python3 experiment/probe.py --features featuresv3/features_n16.pt --target variance --n_bars 16 --probe quadratic
 
-# fix nuisance variable
+# single fixed level only
 python3 experiment/probe.py --features featuresv3/features_n16.pt --target mean --n_bars 4 --probe linear --fix_variance 0
 python3 experiment/probe.py --features featuresv3/features_n16.pt --target variance --n_bars 4 --probe linear --fix_mean 2
 ```
@@ -62,7 +63,7 @@ python3 experiment/probe.py --features featuresv3/features_n16.pt --target varia
 - **Mean**: linear probe on mean-pooled bar tokens — first-order statistic
 - **Variance**: linear probe on `pairwise_diff` — mean squared pairwise difference across bar patch tokens, directly measures representational spread:
   `E[(hᵢ - hⱼ)²] = 2 · Var(h)`
-- **Fix nuisance**: probe mean while fixing variance to one level (and vice versa) to test whether the two statistics are independently represented
+- **Fix nuisance**: probe mean with variance fixed at each level (and vice versa), averaging accuracy across levels, so the two statistics are measured independently
 
 ## Requirements
 

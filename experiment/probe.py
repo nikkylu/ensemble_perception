@@ -6,6 +6,11 @@ to decode mean orientation (6-way) or variance (3-way).
 Sweeps over all slices (cls/bar/bg/all_patches × 12 layers)
 and reports accuracy for each.
 
+By default the nuisance variable is fixed at each of its levels
+(target mean → fix variance, target variance → fix mean), one sweep
+per level, and accuracies are averaged across levels. Pass --fix_mean
+or --fix_variance to run a single level instead.
+
 Usage:
     python3 probe.py --features features.pt --target mean
     python3 probe.py --features features.pt --target variance
@@ -237,6 +242,24 @@ def sweep(features, target, n_bars_filter=None, n_folds=5, lr=1e-3, epochs=200, 
     return results
 
 
+def avg_results(results_list):
+    """Average (mean_acc, std_acc) across sweeps run at each fixed level."""
+    averaged = {}
+    for key in results_list[0]:
+        averaged[key] = (
+            float(np.mean([r[key][0] for r in results_list])),
+            float(np.mean([r[key][1] for r in results_list])),
+        )
+    return averaged
+
+
+def print_results_block(results):
+    """Print per-(slice, layer) lines in the same format sweep() uses."""
+    for (slice_type, layer), (mean_acc, std_acc) in results.items():
+        print(f"  {slice_type:12s}  layer {layer:2d}  "
+              f"acc = {mean_acc:.3f} ± {std_acc:.3f}")
+
+
 # ─────────────────────────────────────────────────────────────────
 # PRINT SUMMARY TABLE
 # ─────────────────────────────────────────────────────────────────
@@ -289,8 +312,7 @@ def main():
     args = parser.parse_args()
 
     features = torch.load(args.features)
-    results = sweep(
-        features, args.target,
+    sweep_kwargs = dict(
         n_bars_filter=args.n_bars,
         n_folds=args.n_folds,
         lr=args.lr,
@@ -298,9 +320,32 @@ def main():
         device=args.device,
         probe_type=args.probe,
         rank=args.rank,
-        fix_mean=args.fix_mean,
-        fix_variance=args.fix_variance,
     )
+
+    if args.fix_mean is not None or args.fix_variance is not None:
+        # single run at one fixed nuisance level
+        results = sweep(features, args.target,
+                        fix_mean=args.fix_mean,
+                        fix_variance=args.fix_variance,
+                        **sweep_kwargs)
+    else:
+        # full protocol: fix the nuisance variable at each of its levels,
+        # sweep per level, then average accuracies across levels
+        if args.target == "mean":
+            nuisance, levels = "variance", features["labels_var"].unique().tolist()
+        else:
+            nuisance, levels = "mean", features["labels_mean"].unique().tolist()
+
+        per_level = []
+        for level in levels:
+            print(f"\n----- fix {nuisance} = {level} -----")
+            fix = {"fix_variance": level} if nuisance == "variance" else {"fix_mean": level}
+            per_level.append(sweep(features, args.target, **fix, **sweep_kwargs))
+
+        results = avg_results(per_level)
+        print(f"\n----- averaged over {len(levels)} fixed {nuisance} levels -----")
+        print_results_block(results)
+
     print_summary(results)
 
 
