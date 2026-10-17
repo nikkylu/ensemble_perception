@@ -238,6 +238,8 @@ def render_example_grid(n_circles: int, rng: np.random.Generator):
                 ax.set_ylabel(f"σ={var_hue}°", fontsize=8)
 
     fig.suptitle(f"N={n_circles} circles — hue stimuli", fontsize=10, y=1.01)
+    fig.supxlabel("Mean hue μ (°)", fontsize=9)
+    fig.supylabel("Hue circular SD σ (°)", fontsize=9)
     plt.tight_layout()
     grid_path = OUTPUT_DIR / f"example_grid_n{n_circles:02d}.png"
     fig.savefig(grid_path, dpi=150, bbox_inches="tight", facecolor="white")

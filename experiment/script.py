@@ -388,6 +388,8 @@ def render_example_grid(n_bars: int, color_bank: list, rng: np.random.Generator)
 
     fig.suptitle(f"N={n_bars} bars — {N_COLORS} colors, 224px",
                  fontsize=10, y=1.01)
+    fig.supxlabel("Mean orientation μ (°)", fontsize=9)
+    fig.supylabel("Orientation SD σ (°)", fontsize=9)
     plt.tight_layout()
     grid_path = OUTPUT_DIR / f"example_grid_n{n_bars:02d}.png"
     fig.savefig(grid_path, dpi=150, bbox_inches="tight", facecolor="white")
