@@ -36,8 +36,9 @@ class LinearProbe(nn.Module):
 
 
 class QuadraticProbe(nn.Module):
-    """ŷ = h^T (U^T U) h + Wh + b
-    Low-rank quadratic: project to k dims, compute all pairwise interactions.
+    """ŷ_c = (Uh)^T A_c (Uh) + W_c h + b_c
+    Low-rank quadratic: project to k dims, compute all pairwise interactions,
+    and learn a separate k x k interaction matrix A_c per class.
     """
 
     def __init__(self, input_dim, n_classes, rank=32):
@@ -67,6 +68,12 @@ def train_probe(h_train, y_train, h_test, y_test,
     probe_type: "linear" or "quadratic"
     Returns test accuracy.
     """
+    # standardize using training-fold statistics only (no test leakage)
+    mu = h_train.mean(0, keepdim=True)
+    sd = h_train.std(0, keepdim=True) + 1e-6
+    h_train = (h_train - mu) / sd
+    h_test = (h_test - mu) / sd
+
     input_dim = h_train.shape[1]
     if probe_type == "quadratic":
         probe = QuadraticProbe(input_dim, n_classes, rank=rank).to(device)
@@ -137,7 +144,9 @@ def compute_pairwise_diff(bar_concat, n_bars):
     bar_concat: (N, L, n_bars*768)
     Returns:    (N, L, 768)
     """
-    N, L, _ = bar_concat.shape
+    N, L, total_dim = bar_concat.shape
+    assert total_dim % n_bars == 0, \
+        f"bar_concat dim {total_dim} not divisible by n_bars {n_bars}"
     tokens = bar_concat.reshape(N, L, n_bars, -1)  # (N, L, n_bars, 768)
     pairs = []
     for i in range(n_bars):
@@ -192,7 +201,7 @@ def sweep(features, target, n_bars_filter=None, n_folds=5, lr=1e-3, epochs=200, 
     extra_features = {}
     if "bar_concat" in features:
         slice_types.append("bar_concat")
-        if n_bars_filter is not None:
+        if n_bars_filter is not None and n_bars_filter >= 2:
             extra_features["pairwise_diff"] = compute_pairwise_diff(
                 features["bar_concat"][indices], n_bars_filter
             )
