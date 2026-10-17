@@ -8,13 +8,21 @@ env/
 # Data & features
 *.pt
 stimuli_v*/
+stimuli_hue_v*/
 featuresv*/
+*.zip
 
 # Outputs
 figures/
 results/
 *.png
 *.jpg
+*.pdf
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
 
 # OS
 .DS_Store
+Thumbs.db
