@@ -1,107 +1,96 @@
 """
-Visualize patch masks overlaid on stimulus images.
-Picks a few stimuli and draws the 16x16 patch grid,
-highlighting bar patches in red.
+Verify the loader's patch masks against the rendered pixels.
+
+--check (default): for every trial, the non-background pixels must lie
+only inside masked patches, every masked patch must contain ink, and the
+number of masked patches must equal the set size — i.e. one element per
+patch and no element crossing a patch boundary.
+
+--plot: overlay the 16x16 grid and masked patches on a few stimuli.
 
 Usage:
-    python3 verify_mask.py --metadata stimuli_v2/metadata.json
-    python3 verify_mask.py --metadata stimuli_v2/metadata.json --n_bars 4 --n_examples 3
+    python3 verify_mask.py --metadata stimuli_ori_s42/metadata.json
+    python3 verify_mask.py --metadata stimuli_ori_s42/metadata.json --plot --n_bars 16
 """
 
-from loader import make_patch_mask, PATCH_PX, GRID
-import json
 import argparse
-from pathlib import Path
+
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from PIL import Image
 
-import sys
-sys.path.append(".")
+from loader import GRID, N_KEYS, PATCH_PX, StimuliDataset, get, make_patch_mask
 
 
-def visualize_mask(trial, meta_root, ax):
-    """Draw one stimulus with its patch mask overlaid."""
-    # load image
-    img_path = meta_root.parent.parent / trial["filename"]
-    img = plt.imread(str(img_path))
-    ax.imshow(img)
+def load(ds, t):
+    img = np.asarray(Image.open(ds.root / t["filename"]).convert("RGB")).astype(int)
+    mask = make_patch_mask(t["positions_x"], t["positions_y"],
+                           ds.extent, ds.center_only).reshape(GRID, GRID)
+    return img, mask
 
-    # compute mask
-    mask = make_patch_mask(
-        trial["positions_x"], trial["positions_y"],
-        bar_len=trial.get("bar_length", 12.0)
-    ).reshape(GRID, GRID)
 
-    # draw grid and highlight bar patches
-    for row in range(GRID):
-        for col in range(GRID):
-            x = col * PATCH_PX - 0.5
-            y = row * PATCH_PX - 0.5
+def check(ds):
+    bad = 0
+    for t in ds.trials:
+        img, mask = load(ds, t)
+        colors, counts = np.unique(img.reshape(-1, 3), axis=0, return_counts=True)
+        bg = colors[counts.argmax()]                              # most common color
+        ink = np.abs(img - bg).sum(-1) > 0
+        ink_patches = ink.reshape(GRID, PATCH_PX, GRID, PATCH_PX).any((1, 3))
+        n = get(t, N_KEYS)
+        errors = []
+        if mask.sum() != n:
+            errors.append(f"{mask.sum()} masked patches for {n} elements")
+        if (ink_patches & ~mask).any():
+            errors.append(f"ink outside mask in {int((ink_patches & ~mask).sum())} patches")
+        if (mask & ~ink_patches).any():
+            errors.append(f"{int((mask & ~ink_patches).sum())} masked patches without ink")
+        if errors:
+            bad += 1
+            if bad <= 10:
+                print(f"  FAIL {t['filename']}: {'; '.join(errors)}")
+    print(f"{len(ds.trials) - bad}/{len(ds.trials)} trials pass "
+          "(one element per patch, no element crosses a patch)")
+    return bad == 0
 
-            if mask[row, col]:
-                # bar patch: red overlay
-                rect = mpatches.Rectangle(
-                    (x, y), PATCH_PX, PATCH_PX,
-                    linewidth=0.5, edgecolor="red",
-                    facecolor="red", alpha=0.3
-                )
-            else:
-                # background patch: just grid lines
-                rect = mpatches.Rectangle(
-                    (x, y), PATCH_PX, PATCH_PX,
-                    linewidth=0.3, edgecolor="gray",
-                    facecolor="none", alpha=0.3
-                )
-            ax.add_patch(rect)
 
-    # mark bar centers
-    for bx, by in zip(trial["positions_x"], trial["positions_y"]):
-        ax.plot(bx, 224-by, "w+", markersize=6, markeredgewidth=1.5)
-
-    ax.set_title(
-        f"n={trial['n_bars']}  μ={trial['mean_orientation']}°  σ={trial['variance']}°",
-        fontsize=9
-    )
-    ax.set_xlim(-0.5, 223.5)
-    ax.set_ylim(223.5, -0.5)
-    ax.set_xticks([])
-    ax.set_yticks([])
+def plot(ds, n_examples, out):
+    step = max(1, len(ds.trials) // n_examples)
+    trials = ds.trials[::step][:n_examples]
+    fig, axes = plt.subplots(1, len(trials), figsize=(4 * len(trials), 4), squeeze=False)
+    for ax, t in zip(axes[0], trials):
+        img, mask = load(ds, t)
+        ax.imshow(img.astype(np.uint8))
+        for r in range(GRID):
+            for c in range(GRID):
+                ax.add_patch(mpatches.Rectangle(
+                    (c * PATCH_PX - 0.5, r * PATCH_PX - 0.5), PATCH_PX, PATCH_PX,
+                    linewidth=0.4, edgecolor="red" if mask[r, c] else "gray",
+                    facecolor="red" if mask[r, c] else "none", alpha=0.3))
+        ax.set_title(f"N={get(t, N_KEYS)}", fontsize=9)
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Saved → {out}")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--metadata", required=True)
-    parser.add_argument("--n_bars", type=int, default=4)
-    parser.add_argument("--n_examples", type=int, default=4)
-    parser.add_argument("--output", default="verify_mask.png")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--metadata", required=True)
+    p.add_argument("--n_bars", type=int, default=None)
+    p.add_argument("--plot", action="store_true")
+    p.add_argument("--n_examples", type=int, default=4)
+    p.add_argument("--output", default="verify_mask.png")
+    a = p.parse_args()
 
-    meta_path = Path(args.metadata)
-    with open(meta_path) as f:
-        meta = json.load(f)
-
-    # filter trials by n_bars
-    trials = [t for t in meta["trials"] if t["n_bars"] == args.n_bars]
-    if not trials:
-        print(f"No trials with n_bars={args.n_bars}")
-        return
-
-    # pick a few examples spread across conditions
-    step = max(1, len(trials) // args.n_examples)
-    examples = trials[::step][:args.n_examples]
-
-    fig, axes = plt.subplots(1, len(examples), figsize=(4 * len(examples), 4))
-    if len(examples) == 1:
-        axes = [axes]
-
-    for ax, trial in zip(axes, examples):
-        visualize_mask(trial, meta_path, ax)
-
-    plt.tight_layout()
-    fig.savefig(args.output, dpi=150, bbox_inches="tight")
-    print(f"Saved → {args.output}")
-    plt.close()
+    ds = StimuliDataset(a.metadata, a.n_bars)
+    if a.plot:
+        plot(ds, a.n_examples, a.output)
+    else:
+        raise SystemExit(0 if check(ds) else 1)
 
 
 if __name__ == "__main__":

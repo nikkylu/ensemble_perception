@@ -1,74 +1,122 @@
-# Ensemble Perception
+# Ensemble Perception in DINOv2
 
-Probing DINOv2 (ViT-B/14) for ensemble perception — testing whether the model encodes the **mean** and **variance** of bar orientations in a stimulus.
-
-## Structure
+Do vision transformers encode ensemble statistics? We probe frozen DINOv2
+(ViT-B/14) for the **mean** and **SD** of a set of elements' orientation, hue
+or size, across layers, token types and set sizes.
 
 ```
-experiment/     stimulis, feature extraction and probing
-  script.py       generate stimuli images + metadata
-  loader.py       DINOv2 feature extraction (per-layer CLS, bar, bg, all_patches)
-  verify_mask.py  visualize patch masks overlaid on stimuli
-  probe.py        linear / quadratic probes over extracted features
-Requirements.txt
+experiment/
+  stimuli/generate.py  stimulus generators (ori | hue | size), standard + discount mode
+  verify_mask.py       pixel check: one element per patch, none crossing a patch
+  loader.py            DINOv2 features per layer: CLS, element / background / all patches, concat
+  probe.py             linear probes, nested CV, all layers × slices in one vectorized fit
+  ideal_observer.py    stimulus-limited ceiling for the probe targets
+  rsa.py               representational similarity analysis
+  plot_neurips.py      paper figures from probe logs
+  pipeline.sh          generate → verify → extract → probe
 ```
 
-## Pipeline
-
-### 1. Generate stimuli
-
-```bash
-python3 experiment/script.py
-```
-
-Produces `stimuli_v*/` with images and `metadata.json` (bar positions, orientations, mean/variance labels).
-
-### 2. Extract features
-
-```bash
-python3 experiment/loader.py --metadata stimuli_v2/metadata.json --output featuresv3/features_n4.pt --n_bars 4
-```
-
-Runs all images through frozen DINOv2 and saves per-layer representations:
-
-- `cls` — CLS token
-- `bar` — mean-pooled bar patch tokens
-- `bg` — mean-pooled background patch tokens
-- `all_patches` — mean-pooled all patch tokens
-- `bar_concat` — concatenated bar patch tokens (fixed set size only)
-
-### 3. Verify patch masks (optional)
-
-```bash
-python3 experiment/verify_mask.py --metadata stimuli_v2/metadata.json --n_bars 4
-```
-
-Saves `verify_mask.png` showing the 16×16 patch grid aligned to the image with bar patches highlighted.
-
-### 4. Probe
-
-```bash
-# full protocol: fixes the nuisance variable at each level and averages
-# (target mean → fix variance per level; target variance → fix mean per level)
-python3 experiment/probe.py --features featuresv3/features_n16.pt --target mean --n_bars 16 --probe linear
-python3 experiment/probe.py --features featuresv3/features_n16.pt --target variance --n_bars 16 --probe quadratic
-
-# single fixed level only
-python3 experiment/probe.py --features featuresv3/features_n16.pt --target mean --n_bars 4 --probe linear --fix_variance 0
-python3 experiment/probe.py --features featuresv3/features_n16.pt --target variance --n_bars 4 --probe linear --fix_mean 2
-```
-
-## Key probing design
-
-- **Mean**: linear probe on mean-pooled bar tokens — first-order statistic
-- **Variance**: linear probe on `pairwise_diff` — mean squared pairwise difference across bar patch tokens, directly measures representational spread:
-  `E[(hᵢ - hⱼ)²] = 2 · Var(h)`
-- **Fix nuisance**: probe mean with variance fixed at each level (and vice versa), averaging accuracy across levels, so the two statistics are measured independently
-
-## Requirements
+## Quick start
 
 ```bash
 pip install -r Requirements.txt
-# DINOv2
-torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+cd experiment
+./pipeline.sh ori                  # seed 42, 50 reps, N = 1 2 3 4 8 16 32
+./pipeline.sh hue 7 50 "8 16"      # domain, seed, reps, set sizes
+python3 plot_neurips.py --results_dir results_s42
 ```
+
+`pipeline.sh` generates the stimuli for all set sizes once, then for each N
+verifies the patch masks, extracts features and probes mean and SD. Outputs are
+keyed by seed, so different seeds never overwrite each other:
+`stimuli_<domain>_s<seed>/`, `features/<domain>_n<N>_s<seed>.pt`,
+`results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}`.
+
+## Stimuli
+
+Commands below run from `experiment/`.
+
+```bash
+python3 stimuli/generate.py ori --seed 42 --n_reps 50     # → stimuli_ori_s42/
+python3 stimuli/generate.py size --set_sizes 8,16
+```
+```python
+from stimuli.generate import OrientationGenerator
+gen = OrientationGenerator(seed=42)
+trial = gen.trial(n=16, mean=30, sd=10, rep=0)   # any rep: an infinite, reproducible stream
+```
+
+Each image is a pure function of `(seed, domain, N, mean, SD, rep)`: the same
+seed always gives the same stimuli, and a larger `--n_reps` adds new reps
+without changing existing ones.
+
+| domain | elements | statistic | means | SDs | task-irrelevant |
+|---|---|---|---|---|---|
+| ori  | bars | orientation, von Mises (doubled angle) | 0…150°, step 30° | 5 / 10 / 15° | length, width, color pair |
+| hue  | circle, square, triangle | hue, von Mises | 0…300°, step 60° | 10 / 20 / 30° | shape, size, rotation, gray-level bg |
+| size | circle, square, triangle, leaf | ln √area, Gaussian | 2.5…5.4 px, step 0.15 ln | 0.025 / 0.05 / 0.075 ln | shape, rotation, color pair |
+
+- **Comparable difficulty:** in every domain the mean step is 6× / 3× / 2× the
+  SD levels, so the 6-way mean and 3-way SD tasks are equally hard in each
+  domain's own statistic space. Size is linear (the end levels have one
+  neighbour), and at fixed N mean size co-varies with total area; metadata
+  stores realized mean log size, mean size and mean area.
+- **Layout:** elements sit anywhere on the 16×16 patch grid, at most one per
+  patch, with jitter bounded so each element stays inside its patch.
+
+**Discount mode** (outliers, after Avci & Boduroglu, 2021, *APP* 83:1141):
+
+```bash
+python3 stimuli/generate.py ori --mode discount                  # outlier in the opposite quadrant
+python3 stimuli/generate.py hue --mode discount --layout mixed   # outlier among the group
+```
+
+N−1 group elements (smallest SD; range capped at ori 30°, hue 60°, size
+0.15 ln) plus one outlier beyond the group's edge by a "less" (ori 15±3°) or
+"more" (ori 90±3°) distinct amount. Metadata and features keep local (group)
+and global means — global both circular and linear (the paper's arithmetic
+mean) — plus the outlier's value and its token slot in `bar_concat`.
+
+## Features
+
+```bash
+python3 loader.py --metadata stimuli_ori_s42/metadata.json --n_bars 16 --output feats.pt
+```
+
+Per layer (fp16): `cls`, `bar` (mean of element patches), `bg` (mean of
+background patches), `all_patches`, and — when one set size is extracted —
+`bar_concat` / `bg_concat` (tokens concatenated in raster order).
+
+## Probes
+
+```bash
+python3 probe.py --features feats.pt --target mean --n_bars 16
+python3 probe.py --features feats.pt --target variance --n_bars 16 --save res.json
+```
+
+- **Slices:** `cls`, `bar`, `bg`, `all_patches`, `pairwise_diff`
+  (per-dim mean squared difference between element tokens = 2·Var), `bar_concat`;
+  opt-in `--bg_concat`, `--per_token` (one probe shared by all element tokens,
+  scored per token and by averaging an image's token logits).
+- **Nuisance fixed:** the mean is probed separately at each SD level (and vice
+  versa); accuracies are averaged over levels, and the per-level table is
+  printed too (`--save` keeps every level's fold accuracies and λ).
+- **Nested CV:** outer 5 folds score; inside each outer training set an inner
+  CV picks the L2 strength λ (one per slice, at the middle layer;
+  `--lambda_select layer` for per-layer, `--weight_decay x` to fix it).
+  Features are standardized per fold.
+- **Two summaries:** `best` = max over layers (layer picked on the test folds,
+  optimistic) and `cv-best` = layer picked on the other folds (unbiased).
+- **Fast:** all layers × folds × λ × 768-d slices are independent logistic
+  regressions trained in one vectorized full-batch loop.
+
+## Ideal observer
+
+```bash
+python3 ideal_observer.py ori        # also: hue, size
+```
+
+Probes decode the *nominal* condition, but each display's realized statistics
+scatter around it — much more at small N. Even a perfect encoder of the realized
+statistic is therefore capped below 1 and improves with N. Compare probe
+accuracy with this ceiling before reading a set-size effect as averaging.

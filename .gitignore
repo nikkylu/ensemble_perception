@@ -26,3 +26,8 @@ results/
 # OS
 .DS_Store
 Thumbs.db
+
+# seed-keyed pipeline outputs
+stimuli_*_s*/
+features/
+results_*/
