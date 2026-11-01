@@ -1,5 +1,5 @@
 """
-DINOv2 feature extraction for orientation / hue ensemble stimuli.
+DINOv2 feature extraction for orientation / hue / size ensemble stimuli.
 
 Output .pt dict:
     cls / bar / bg / all_patches : (N, L, D)  CLS token and mean-pooled patch groups
@@ -9,6 +9,8 @@ Output .pt dict:
     mean_values / var_values     : condition value (deg) of each label
     period                       : circle period of the mean (180 ori, 360 hue,
                                    0 = linear in log space for size)
+    realized_mean / realized_sd  : (N,) each display's realized statistics
+                                   (deg, or ln px for size)
   discount-mode stimuli additionally (statistic space: deg, or ln px for size):
     local_mean / global_mean     : (N,) realized mean without / with the outlier
     global_mean_linear           : (N,) with the outlier unwrapped on its side
@@ -45,6 +47,8 @@ N_LAYERS = 12
 MEAN_KEYS = ("mean_orientation", "mean_hue", "mean_size")
 VAR_KEYS = ("variance", "variance_hue", "sd_size")
 N_KEYS = ("n_bars", "n_circles", "n_items")
+REALIZED_MEAN_KEYS = ("actual_circular_mean", "actual_circular_mean_hue", "actual_mean_log_size")
+REALIZED_SD_KEYS = ("actual_circular_sd", "actual_circular_sd_hue", "actual_sd_log_size")
 
 
 def get(trial, keys):
@@ -121,6 +125,16 @@ class StimuliDataset(Dataset):
         self.set_sizes = sorted({get(t, N_KEYS) for t in self.trials})
         first = self.trials[0]
         self.period = 360 if "mean_hue" in first else 0 if "mean_size" in first else 180
+
+    def realized_info(self):
+        """Realized per-display mean / SD (statistic space), if in the metadata."""
+        try:
+            return {"realized_mean": torch.tensor([float(get(t, REALIZED_MEAN_KEYS))
+                                                   for t in self.trials]),
+                    "realized_sd": torch.tensor([float(get(t, REALIZED_SD_KEYS))
+                                                 for t in self.trials])}
+        except KeyError:
+            return {}
 
     def discount_info(self):
         """Per-trial outlier fields (discount-mode stimuli), else {}."""
@@ -217,7 +231,7 @@ def extract(model, dataset, device, batch_size=32, out_dtype=torch.float16):
     out = {k: torch.cat(v) for k, v in out.items()}
     out.update(filenames=filenames, mean_values=dataset.mean_values,
                var_values=dataset.var_values, period=dataset.period,
-               **dataset.discount_info())
+               **dataset.realized_info(), **dataset.discount_info())
     return out
 
 

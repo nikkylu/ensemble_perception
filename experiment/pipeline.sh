@@ -2,10 +2,12 @@
 # End-to-end run over every stimulus set:
 #   domains  ori, hue, size
 #   modes    standard           mean + SD probes, N = all set sizes
-#            discount_spatial   outlier in the opposite quadrant    } mean probe only (one SD
-#            discount_mixed     outlier among the group             }  level), N ≥ 3
+#            discount_spatial   outlier in the opposite quadrant    } N ≥ 3: group-mean probe +
+#            discount_mixed     outlier among the group             } discount analysis
 # For each (domain, mode): generate stimuli once, then per set size N
-#   verify patch masks → extract DINOv2 features → probe.
+#   verify patch masks → extract DINOv2 features → probe
+#   (discount sets also: discount.py — mean readout trained on the standard
+#    features of the same N, tested on the outlier displays; needs standard first).
 #
 #   ./pipeline.sh                              # everything, seed 42, 50 reps
 #   ./pipeline.sh "ori hue" 7 50 "8 16"        # domains, seed, reps, set sizes
@@ -16,6 +18,7 @@
 #   features/<domain>_<mode>_n<N>_s<seed>.pt
 #   results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}         standard (plot_neurips.py input)
 #   results_s<seed>/<domain>_<mode>/n<N>_mean_linear.{txt,json}      discount
+#   results_s<seed>/<domain>_<mode>/n<N>_discount.{txt,json}         outlier weight β
 set -e
 cd "$(dirname "$0")"
 
@@ -58,6 +61,12 @@ for DOMAIN in $DOMAINS; do
         python3 probe.py --features $FEATS --target $TARGET --n_bars $N --seed $SEED \
             --save $RES/n${N}_${TARGET}_linear.json | tee $RES/n${N}_${TARGET}_linear.txt
       done
+      TRAIN=features/${DOMAIN}_standard_n${N}_s${SEED}.pt
+      if [[ $MODE != standard && -f $TRAIN ]]; then
+        echo "=== $DOMAIN / $MODE / N=$N: discount analysis ==="
+        python3 discount.py --train $TRAIN --test $FEATS \
+            --save $RES/n${N}_discount.json | tee $RES/n${N}_discount.txt
+      fi
     done
   done
 done
