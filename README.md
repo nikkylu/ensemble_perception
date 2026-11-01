@@ -10,7 +10,6 @@ experiment/
   verify_mask.py       pixel check: one element per patch, none crossing a patch
   loader.py            DINOv2 features per layer: CLS, element / background / all patches, concat
   probe.py             linear probes, nested CV, all layers × slices in one vectorized fit
-  ideal_observer.py    stimulus-limited ceiling for the probe targets
   rsa.py               representational similarity analysis
   plot_neurips.py      paper figures from probe logs
   pipeline.sh          generate → verify → extract → probe
@@ -21,16 +20,24 @@ experiment/
 ```bash
 pip install -r Requirements.txt
 cd experiment
-./pipeline.sh ori                  # seed 42, 50 reps, N = 1 2 3 4 8 16 32
-./pipeline.sh hue 7 50 "8 16"      # domain, seed, reps, set sizes
+./pipeline.sh                              # all domains × modes, seed 42, 50 reps
+./pipeline.sh "ori hue" 7 50 "8 16"        # domains, seed, reps, set sizes
+MODES=standard ./pipeline.sh size          # only the standard stimuli
 python3 plot_neurips.py --results_dir results_s42
 ```
 
-`pipeline.sh` generates the stimuli for all set sizes once, then for each N
-verifies the patch masks, extracts features and probes mean and SD. Outputs are
-keyed by seed, so different seeds never overwrite each other:
-`stimuli_<domain>_s<seed>/`, `features/<domain>_n<N>_s<seed>.pt`,
-`results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}`.
+For every domain (ori, hue, size) and mode — `standard`, `discount_spatial`,
+`discount_mixed` — `pipeline.sh` generates the stimuli once, then for each set
+size N verifies the patch masks, extracts features and probes. Standard sets
+probe mean and SD for all N; discount sets (one SD level, N ≥ 3) probe the
+group mean. Outputs are keyed by seed:
+
+| | path |
+|---|---|
+| stimuli | `stimuli_<domain>[_discount_<layout>]_s<seed>/` |
+| features | `features/<domain>_<mode>_n<N>_s<seed>.pt` |
+| standard results | `results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}` (read by `plot_neurips.py`) |
+| discount results | `results_s<seed>/<domain>_<mode>/n<N>_mean_linear.{txt,json}` |
 
 ## Stimuli
 
@@ -109,14 +116,3 @@ python3 probe.py --features feats.pt --target variance --n_bars 16 --save res.js
   optimistic) and `cv-best` = layer picked on the other folds (unbiased).
 - **Fast:** all layers × folds × λ × 768-d slices are independent logistic
   regressions trained in one vectorized full-batch loop.
-
-## Ideal observer
-
-```bash
-python3 ideal_observer.py ori        # also: hue, size
-```
-
-Probes decode the *nominal* condition, but each display's realized statistics
-scatter around it — much more at small N. Even a perfect encoder of the realized
-statistic is therefore capped below 1 and improves with N. Compare probe
-accuracy with this ceiling before reading a set-size effect as averaging.
