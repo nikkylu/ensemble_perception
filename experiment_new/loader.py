@@ -3,8 +3,12 @@ DINOv2 feature extraction for orientation / hue / size ensemble stimuli.
 
 Output .pt dict:
     cls / bar / bg / all_patches : (N, L, D)  CLS token and mean-pooled patch groups
-    bar_concat / bg_concat       : (N, L, k*D) element / background tokens in
-                                   raster order (only when all trials share a set size)
+    bar_concat                   : (N, L, k*D) element tokens in block-major
+                                   raster order — the block² tokens of one
+                                   element are adjacent (block=1: plain
+                                   raster); only when all trials share a set size
+    bg_concat        (opt-in)    : background tokens likewise (--bg_concat;
+                                   ~190k-d, dominates the file size)
     labels_mean / labels_var     : (N,) int class labels (sorted condition values)
     mean_values / var_values     : condition value (deg) of each label
     period                       : circle period of the mean (180 ori, 360 hue,
@@ -58,6 +62,18 @@ def get(trial, keys):
     raise KeyError(f"none of {keys} in trial metadata")
 
 
+def token_rows(bar_concat, n, max_slots=8, seed=0):
+    """Single element tokens as separate rows: ≤ max_slots random element
+    slots of each display, trial-major. Relies on this module's block-major
+    concat order (the block² tokens of one element are adjacent).
+    (T, L, n·D) → ((T·k, L, D), k)"""
+    T, L, tot = bar_concat.shape
+    k = min(n, max_slots)
+    slots = torch.as_tensor(np.random.default_rng(seed).choice(n, k, replace=False))
+    toks = bar_concat.reshape(T, L, n, tot // n)[:, :, slots]
+    return toks.permute(0, 2, 1, 3).reshape(T * k, L, -1), k
+
+
 def pick_device():
     if torch.cuda.is_available():
         return "cuda"
@@ -70,16 +86,24 @@ def pick_device():
 # PATCH MASK
 # ─────────────────────────────────────────────────────────────────
 
-def make_patch_mask(xs, ys, extent=12.0, center_only=True):
+def make_patch_mask(xs, ys, extent=12.0, center_only=True, block=1):
     """(256,) bool mask of patches containing an element.
 
     xs, ys: element centers in px, y bottom-up (generator convention).
     center_only: generators v5+/hue v3 keep each element inside its own
-    patch, so the patch containing the center is exact. Older stimuli
-    fall back to the element's axis-aligned box of size `extent`.
+    BLOCK×BLOCK patch cell (block=1: single patch), so the cell containing
+    the center is exact. Older stimuli fall back to the element's
+    axis-aligned box of size `extent`.
     """
     mask = np.zeros((GRID, GRID), dtype=bool)
-    half = 0.0 if center_only else extent / 2
+    if center_only:
+        cell, g = PATCH_PX * block, GRID // block
+        for x, y in zip(xs, ys):
+            rb = min(int((224 - y) // cell), g - 1)           # image rows top-down,
+            cb = min(int(x // cell), g - 1)                   # clamped at the edge
+            mask[rb * block:(rb + 1) * block, cb * block:(cb + 1) * block] = True
+        return mask.ravel()
+    half = extent / 2
     for x, y in zip(xs, ys):
         y = 224 - y                                    # → image rows (top-down)
         r0, r1 = int(max(0, y - half) // PATCH_PX), int(min(223, y + half) // PATCH_PX)
@@ -110,6 +134,7 @@ class StimuliDataset(Dataset):
         self.root = (meta_path.parent if params.get("paths_relative_to") == "metadata"
                      else meta_path.parent.parent)
         self.center_only = bool(params.get("elements_within_patch", False))
+        self.block = int(params.get("patch_block", 1))
         if "bar_length_range" in params:
             self.extent = float(max(params["bar_length_range"]))
         elif "size_range" in params:
@@ -148,13 +173,15 @@ class StimuliDataset(Dataset):
         info["outlier_distinct"] = torch.tensor(
             [t["outlier"]["distinct"] == "more" for t in self.trials], dtype=torch.long)
         slots = []
+        cell, g = PATCH_PX * self.block, GRID // self.block
         for t in self.trials:
             i = t["outlier"]["index"]
-            # patch index of every element; the outlier's rank in raster order
-            # is its slot among the masked tokens (one element per patch)
-            patch = [int((224 - y) // PATCH_PX) * GRID + int(x // PATCH_PX)
+            # cell index of every element; the outlier's rank in cell raster
+            # order is its slot among the element token groups (one element
+            # per BLOCK×BLOCK cell; extract() emits tokens in block-major order)
+            cells = [int((224 - y) // cell) * g + int(x // cell)
                      for x, y in zip(t["positions_x"], t["positions_y"])]
-            slots.append(sorted(patch).index(patch[i]))
+            slots.append(sorted(cells).index(cells[i]))
         info["outlier_slot"] = torch.tensor(slots)
         return info
 
@@ -165,7 +192,8 @@ class StimuliDataset(Dataset):
         t = self.trials[i]
         image = self.normalize(Image.open(self.root / t["filename"]).convert("RGB"))
         mask = torch.from_numpy(make_patch_mask(
-            t["positions_x"], t["positions_y"], self.extent, self.center_only))
+            t["positions_x"], t["positions_y"], self.extent, self.center_only,
+            self.block))
         return (image, mask,
                 self.mean_values.index(get(t, MEAN_KEYS)),
                 self.var_values.index(get(t, VAR_KEYS)),
@@ -199,27 +227,39 @@ def masked_concat(tokens, mask):
 # ─────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def extract(model, dataset, device, batch_size=32, out_dtype=torch.float16):
+def extract(model, dataset, device, batch_size=32, out_dtype=torch.float16,
+            bg_concat=False):
     # concatenated slices are only well-defined when every trial has the
-    # same number of element patches
+    # same number of element patches; bg_concat (~190k-d) dominates the
+    # file size, so it is opt-in (as in probe.py)
     concat = len(dataset.set_sizes) == 1
+    # block-major patch order: the block² tokens of one element stay adjacent
+    # in the *_concat slices (block=1: identity / plain raster order)
+    B = dataset.block
+    idx = torch.arange(GRID * GRID).reshape(GRID, GRID)
+    perm = torch.cat([idx[r:r + B, c:c + B].reshape(-1)
+                      for r in range(0, GRID, B) for c in range(0, GRID, B)])
     loader = DataLoader(dataset, batch_size, num_workers=4, collate_fn=collate)
-    keys = ["cls", "bar", "bg", "all_patches"] + (["bar_concat", "bg_concat"] if concat else [])
+    keys = (["cls", "bar", "bg", "all_patches"]
+            + (["bar_concat"] if concat else [])
+            + (["bg_concat"] if concat and bg_concat else []))
     out = {k: [] for k in keys + ["labels_mean", "labels_var", "n_bars"]}
     filenames = []
 
     for images, masks, lm, lv, n, names in loader:
         layers = model.get_intermediate_layers(
             images.to(device), n=N_LAYERS, return_class_token=True)
+        masks = masks[:, perm]
         per_layer = {k: [] for k in keys}
         for patches, cls in layers:
-            patches = patches.float().cpu().to(out_dtype)             # (B, 256, D)
+            patches = patches.float().cpu().to(out_dtype)[:, perm]    # (B, 256, D)
             per_layer["cls"].append(cls.float().cpu().to(out_dtype))
             per_layer["all_patches"].append(patches.float().mean(1).to(out_dtype))
             per_layer["bar"].append(masked_mean(patches, masks))
             per_layer["bg"].append(masked_mean(patches, ~masks))
             if concat:
                 per_layer["bar_concat"].append(masked_concat(patches, masks))
+            if "bg_concat" in keys:
                 per_layer["bg_concat"].append(masked_concat(patches, ~masks))
         for k in keys:
             out[k].append(torch.stack(per_layer[k], dim=1))          # (B, L, ·)
@@ -245,12 +285,15 @@ def main():
     p.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
     p.add_argument("--n_bars", type=int, default=None,
                    help="only extract this set size (needed for *_concat slices)")
+    p.add_argument("--bg_concat", action="store_true",
+                   help="also save concatenated background tokens "
+                        "(~190k-d, dominates the file size)")
     a = p.parse_args()
 
     dataset = StimuliDataset(a.metadata, a.n_bars)
     model = torch.hub.load("facebookresearch/dinov2", a.model).to(a.device).eval()
     dtype = torch.float16 if a.precision == "fp16" else torch.float32
-    feats = extract(model, dataset, a.device, a.batch_size, dtype)
+    feats = extract(model, dataset, a.device, a.batch_size, dtype, a.bg_concat)
 
     for k, v in feats.items():
         if isinstance(v, torch.Tensor):

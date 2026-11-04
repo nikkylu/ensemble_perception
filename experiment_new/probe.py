@@ -24,6 +24,16 @@ Protocol
 - "best" = max over layers (layer chosen on the test folds: optimistic);
   "cv-best" = layer chosen on the other outer folds (unbiased).
 
+Labels: classification relabels each trial to the level nearest its
+REALIZED statistic (needs realized_mean / realized_sd in the features
+file); nuisance levels stay defined by the condition labels.
+
+Regression (--target mean_reg / variance_reg): closed-form ridge reads the
+realized statistic WITHIN each (mean, SD) cell (λ by LOOCV); predictions
+pool across cells; reported per (slice, layer): Pearson r (in the "acc"
+slot) and MAE. The per_token slice regresses the display statistic from
+ONE element token (≤ 8 random slots; local-information cap r ≈ 1/√N).
+
 Efficiency: every (slice, layer, fold, λ) probe is an independent logistic
 regression; all of them are trained together in one vectorized full-batch
 Adam loop. Per-probe losses are summed, so each probe gets exactly the
@@ -32,7 +42,7 @@ gradient it would get alone.
 Usage:
     python3 probe.py --features feats.pt --target mean --n_bars 16
     python3 probe.py --features feats.pt --target variance --n_bars 16 --save res.json
-    python3 probe.py --features feats.pt --target variance --n_bars 16 --weight_decay 0
+    python3 probe.py --features feats.pt --target mean_reg --n_bars 16
 """
 
 import argparse
@@ -43,6 +53,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.model_selection import StratifiedKFold
+
+from loader import token_rows
 
 N_LAYERS = 12
 POOLED = ["cls", "bar", "bg", "all_patches"]
@@ -250,9 +262,150 @@ def select_indices(features, n_bars=None, fix_mean=None, fix_variance=None):
     return keep.nonzero(as_tuple=True)[0]
 
 
-def sweep(features, target, idx, n=None, per_token=False, bg_concat=False, **kw):
-    """Probe every slice on trials `idx`. → {slice: {"acc": (12, F), "lam": (12, F)}}"""
-    y = features["labels_mean" if target == "mean" else "labels_var"][idx]
+def realized_stat(features, target):
+    """Each trial's realized statistic, and the condition levels, in matching
+    units. Size means: mean_values are px but realized_mean is ln(px) → ln.
+    Discount feature files: the GROUP (local) statistic — realized_mean there
+    includes the outlier, which would shift labels toward it."""
+    key = "realized_mean" if target == "mean" else "realized_sd"
+    local = "local_mean" if target == "mean" else "local_sd"
+    if local in features:
+        key = local
+    assert key in features, (
+        f"{key} missing from the features file; re-extract with a loader.py "
+        "that saves realized statistics (metadata must have actual_* fields)")
+    vals = torch.tensor(features["mean_values" if target == "mean" else "var_values"],
+                        dtype=torch.float32)
+    if target == "mean" and not features.get("period", 0):
+        vals = vals.log()
+    return features[key].float(), vals
+
+
+def realized_level(features, target):
+    """Index of the condition level nearest each trial's REALIZED statistic.
+    mean: circular distance on `period` (ori/hue), linear for size.
+    variance: linear distance (circular SD is a non-negative scalar)."""
+    real, vals = realized_stat(features, target)
+    d = (real[:, None] - vals[None, :]).abs()
+    period = features.get("period", 0)
+    if target == "mean" and period:
+        d = torch.minimum(d, period - d)
+    return d.argmin(dim=1)
+
+
+def realized_deviation(features, target):
+    """Signed deviation of each trial's realized statistic from its condition
+    value (wrapped to ±period/2 for circular means)."""
+    real, vals = realized_stat(features, target)
+    labels = features["labels_mean" if target == "mean" else "labels_var"]
+    d = real - vals[labels]
+    period = features.get("period", 0)
+    if target == "mean" and period:
+        d = (d + period / 2) % period - period / 2
+    return d
+
+
+# ─────────────────────────────────────────────────────────────────
+# REGRESSION — realized statistic within each condition cell
+# ─────────────────────────────────────────────────────────────────
+
+REG_LAMBDAS = torch.logspace(-2, 6, 9, dtype=torch.float64)
+
+
+def ridge_cell(H, y, n_folds, seed, groups=None):
+    """Closed-form dual ridge per (layer, fold): per-fold standardization,
+    λ chosen by LOOCV over the training rows. Exact, no iterations.
+    H (n, L, D), y (n,) → (test mask (n, F) bool, predictions (n, L, F)).
+    groups: rows with the same group id (e.g. tokens of one image) always
+    land in the same fold."""
+    n, L, _ = H.shape
+    H, y = H.double(), y.double()
+    if groups is None:
+        groups = torch.arange(n)
+    uniq, inv = torch.unique(torch.as_tensor(groups), return_inverse=True)
+    assert len(uniq) >= n_folds, (
+        f"{len(uniq)} groups cannot fill {n_folds} folds (raise n_reps "
+        "or lower --n_folds)")
+    gf = torch.as_tensor(np.random.default_rng(seed).permutation(len(uniq)) % n_folds)
+    folds = gf[inv]
+    te = torch.zeros(n, n_folds, dtype=torch.bool)
+    preds = torch.zeros(n, L, n_folds, dtype=torch.float64)
+    for f in range(n_folds):
+        tr = folds != f
+        te[~tr, f] = True
+        mu, sd = H[tr].mean(0), H[tr].std(0) + 1e-6
+        Z = (H - mu) / sd
+        ym = y[tr].mean()
+        yc = y[tr] - ym
+        Ztr = Z[tr]                                             # (m, L, D)
+        K = torch.einsum("mld,nld->lmn", Ztr, Ztr)              # (L, m, m)
+        evals, U = torch.linalg.eigh(K)                         # K = U e Uᵀ
+        Uy = torch.einsum("lmn,m->ln", U, yc)                   # (L, m)
+        den = evals[None] + REG_LAMBDAS[:, None, None]          # (Q, L, m)
+        fit = torch.einsum("lmn,qln->qlm", U, evals[None] / den * Uy[None])
+        h = torch.einsum("lmn,qln->qlm", U ** 2, evals[None] / den)
+        loo = ((yc[None, None] - fit) / (1 - h).clamp(min=1e-3)) ** 2
+        best = loo.mean(-1).argmin(0)                           # (L,)
+        alpha = torch.einsum("lmn,ln->lm", U,
+                             Uy / (evals + REG_LAMBDAS[best][:, None]))
+        Kte = torch.einsum("tld,mld->ltm", Z[~tr], Ztr)         # (L, t, m)
+        preds[~tr, :, f] = (torch.einsum("ltm,lm->lt", Kte, alpha) + ym).T
+    return te, preds.float()
+
+
+def pooled_metrics(ys, preds, n_folds):
+    """ys: per fold, list of (P,); preds: per fold, list of (L, P).
+    → r (L, F) Pearson over the fold's pooled cells, mae (L,) over everything."""
+    r = np.zeros((N_LAYERS, n_folds))
+    for f in range(n_folds):
+        yt, yp = ys[f] - ys[f].mean(), preds[f] - preds[f].mean(1, keepdims=True)
+        r[:, f] = (yp @ yt) / np.maximum(np.linalg.norm(yp, axis=1)
+                                         * np.linalg.norm(yt), 1e-12)
+    mae = np.concatenate([np.abs(p - y[None]) for y, p in zip(ys, preds)],
+                         axis=1).mean(axis=1)
+    return r, mae
+
+
+def sweep_reg(features, idx_cells, dev, n=None, n_folds=5, seed=42):
+    """Ridge-regress the realized deviation within each condition cell; pool
+    test predictions over cells. idx_cells: list of trial-index tensors (one
+    per target level at a fixed nuisance level).
+    → {slice: {"acc": pearson r (12, F), "lam": None, "mae": (12,)}}"""
+    out = {}
+    slices = {}
+    for st in POOLED:
+        slices[st] = lambda i, st=st: (features[st][i].float(), 1)
+    if "bar_concat" in features and n and n >= 2:
+        slices["pairwise_diff"] = lambda i: (compute_pairwise_diff(
+            features["bar_concat"][i].float(), n), 1)
+        slices["bar_concat"] = lambda i: (features["bar_concat"][i].float(), 1)
+        # aggregation control: one element token → the display's statistic
+        slices["per_token"] = lambda i: token_rows(
+            features["bar_concat"][i].float(), n, seed=seed)
+    for st, get in slices.items():
+        ys = [[] for _ in range(n_folds)]
+        preds = [[] for _ in range(n_folds)]
+        for idx in idx_cells:
+            H, r_img = get(idx)
+            y = dev[idx].repeat_interleave(r_img)
+            groups = torch.arange(len(idx)).repeat_interleave(r_img)
+            te, pr = ridge_cell(H, y, n_folds, seed, groups=groups)
+            for f in range(n_folds):
+                ys[f].append(y[te[:, f]].numpy())
+                preds[f].append(pr[te[:, f], :, f].numpy().T)
+        ys = [np.concatenate(v) for v in ys]
+        preds = [np.concatenate(v, axis=1) for v in preds]
+        r, mae = pooled_metrics(ys, preds, n_folds)
+        out[st] = {"acc": r, "lam": None, "mae": mae}
+    return {st: out[st] for st in SLICE_ORDER if st in out}
+
+
+def sweep(features, target, idx, n=None, per_token=False, bg_concat=False,
+          y=None, **kw):
+    """Probe every slice on trials `idx`. → {slice: {"acc": (12, F), "lam": (12, F)}}
+    `y` overrides the condition labels (e.g. realized-statistic relabeling)."""
+    if y is None:
+        y = features["labels_mean" if target == "mean" else "labels_var"][idx]
     n_classes = len(features["labels_mean" if target == "mean" else "labels_var"].unique())
     print(f"{len(y)} trials, class counts {np.bincount(y.numpy()).tolist()}")
 
@@ -314,7 +467,8 @@ def print_level_table(per_level, levels, nuisance):
 def to_json(results):
     return {st: {"folds": r["acc"].tolist(), "best": float(r["acc"].mean(1).max()),
                  "cv_best": cv_best(r["acc"]),
-                 "lambda": None if r.get("lam") is None else r["lam"].tolist()}
+                 "lambda": None if r.get("lam") is None else r["lam"].tolist(),
+                 **({"mae": r["mae"].tolist()} if "mae" in r else {})}
             for st, r in results.items()}
 
 
@@ -325,7 +479,8 @@ def to_json(results):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--features", required=True, help="features .pt from loader.py")
-    p.add_argument("--target", required=True, choices=["mean", "variance"])
+    p.add_argument("--target", required=True,
+                   choices=["mean", "variance", "mean_reg", "variance_reg"])
     p.add_argument("--n_bars", type=int, default=None, help="set size to probe")
     p.add_argument("--fix_mean", type=int, default=None,
                    help="probe a single fixed mean level (label index)")
@@ -360,7 +515,13 @@ def main():
               device=a.device)
 
     # the nuisance statistic is held fixed at each of its levels (or one level)
-    nuisance = "variance" if a.target == "mean" else "mean"
+    base = a.target.replace("_reg", "")
+    regress = a.target.endswith("_reg")
+    if regress:
+        assert (a.fix_mean if base == "mean" else a.fix_variance) is None, (
+            f"--fix_{base} conflicts with {a.target}: the regression iterates "
+            f"the {base} levels itself; fix only the nuisance")
+    nuisance = "variance" if base == "mean" else "mean"
     if a.fix_mean is not None or a.fix_variance is not None:
         nuisance = "mean" if a.fix_mean is not None else "variance"
         levels = [a.fix_mean if nuisance == "mean" else a.fix_variance]
@@ -368,11 +529,34 @@ def main():
         levels = features["labels_var" if nuisance == "variance" else "labels_mean"
                           ].unique().tolist()
 
+    labels = features["labels_mean" if base == "mean" else "labels_var"]
+    if regress:
+        dev = realized_deviation(features, base)
+        unit = "°" if features.get("period", 0) else " ln"
+    else:
+        real = realized_level(features, base)   # label = nearest realized level
+
     per_level = []
     for level in levels:
         print(f"\n----- fix {nuisance} = {level} -----")
-        idx = select_indices(features, a.n_bars, **{f"fix_{nuisance}": level})
-        per_level.append(sweep(features, a.target, idx, **kw))
+        if regress:
+            n_levels = len(features["mean_values" if base == "mean" else "var_values"])
+            cells = [select_indices(features, a.n_bars,
+                                    **{f"fix_{nuisance}": level,
+                                       f"fix_{base}": t}) for t in range(n_levels)]
+            d = torch.cat([dev[c] for c in cells]).numpy()
+            print(f"regressing realized {base} deviation over {len(cells)} cells, "
+                  f"{len(d)} trials (deviation IQR "
+                  f"{np.percentile(d, 75) - np.percentile(d, 25):.2f}{unit})")
+            per_level.append(sweep_reg(features, cells, dev, n=a.n_bars,
+                                       n_folds=a.n_folds, seed=a.seed))
+        else:
+            idx = select_indices(features, a.n_bars, **{f"fix_{nuisance}": level})
+            y = real[idx]
+            moved = int((y != labels[idx]).sum())
+            print(f"labels = nearest realized level: {moved}/{len(idx)} trials "
+                  f"moved from their condition level")
+            per_level.append(sweep(features, base, idx, y=y, **kw))
         print_rows(per_level[-1])
         print_summary(per_level[-1])
 

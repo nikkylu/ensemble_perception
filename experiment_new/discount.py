@@ -43,6 +43,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from loader import token_rows
+
 N_LAYERS = 12
 SLICES = ["cls", "bar", "bg", "all_patches"]
 LAMBDAS = np.logspace(-2, 4, 13)
@@ -87,11 +89,15 @@ def ridge_all(X, Y, lambdas):
     return np.stack([Vt.T @ ((s / (s ** 2 + lam))[:, None] * UtY) for lam in lambdas])
 
 
-def fit_readout(X, m, P, n_folds=5, seed=0):
+def fit_readout(X, m, P, n_folds=5, seed=0, groups=None):
     """Ridge from features to the encoded mean; λ by k-fold CV error.
+    groups: rows sharing an id (tokens of one display) stay in one fold.
     Returns (predict function, CV error at the chosen λ, chosen λ)."""
     Y = encode(m, P)
-    folds = np.random.default_rng(seed).permutation(len(X)) % n_folds
+    if groups is None:
+        groups = np.arange(len(X))
+    uniq, inv = np.unique(groups, return_inverse=True)
+    folds = (np.random.default_rng(seed).permutation(len(uniq)) % n_folds)[inv]
     err = np.zeros(len(LAMBDAS))
     for f in range(n_folds):
         tr, te = folds != f, folds == f
@@ -114,13 +120,17 @@ def fit_readout(X, m, P, n_folds=5, seed=0):
 # ─────────────────────────────────────────────────────────────────
 
 def slices(feats, n):
-    """{slice: (trials, L, D) float array}; bar_group drops the outlier token."""
+    """{slice: (trials, L, D) float array}; bar_group drops the outlier
+    token, bar_outlier is the outlier's token alone (readout trained on
+    standard single tokens)."""
     out = {st: feats[st].float().numpy() for st in SLICES}
     if "bar_concat" in feats and "outlier_slot" in feats:
         tok = feats["bar_concat"].float().reshape(len(feats["n_bars"]), N_LAYERS, n, -1)
         keep = torch.ones(tok.shape[0], n, dtype=torch.bool)
         keep[torch.arange(tok.shape[0]), feats["outlier_slot"]] = False
         out["bar_group"] = (tok * keep[:, None, :, None]).sum(2).div(n - 1).numpy()
+        out["bar_outlier"] = tok[torch.arange(tok.shape[0]), :,
+                                 feats["outlier_slot"]].numpy()
     return out
 
 
@@ -142,14 +152,24 @@ def analyse(train, test):
     distinct = test["outlier_distinct"].numpy()
     X_train = slices(train, int(train["n_bars"][0]))
     X_test = slices(test, n)
+    # bar_outlier is a single token: its readout trains on standard single tokens
+    X_single = m_single = g_single = None
+    if "bar_outlier" in X_test and "bar_concat" in train:
+        rows_tok, k = token_rows(train["bar_concat"].float(), int(train["n_bars"][0]))
+        X_single = rows_tok.numpy()
+        m_single = np.repeat(m_train, k)
+        g_single = np.repeat(np.arange(len(m_train)), k)   # fold by display
 
     res = {}
     for st in X_test:
-        # bar_group has no standard counterpart: use the readout trained on `bar`
-        src = st if st in X_train else "bar"
+        if st == "bar_outlier" and X_single is not None:
+            X_tr, m_tr, g_tr = X_single, m_single, g_single
+        else:
+            # bar_group has no standard counterpart: use the readout trained on `bar`
+            X_tr, m_tr, g_tr = X_train[st if st in X_train else "bar"], m_train, None
         rows = []
         for layer in range(N_LAYERS):
-            predict, cv_err, lam = fit_readout(X_train[src][:, layer], m_train, P)
+            predict, cv_err, lam = fit_readout(X_tr[:, layer], m_tr, P, groups=g_tr)
             pred = predict(X_test[st][:, layer])
             row = {"cv_err": cv_err, "lambda": lam}
             for k, name in enumerate(["less", "more"]):

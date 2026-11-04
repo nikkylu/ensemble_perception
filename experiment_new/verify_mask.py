@@ -28,32 +28,37 @@ from loader import GRID, N_KEYS, PATCH_PX, StimuliDataset, get, make_patch_mask
 def load(ds, t):
     img = np.asarray(Image.open(ds.root / t["filename"]).convert("RGB")).astype(int)
     mask = make_patch_mask(t["positions_x"], t["positions_y"],
-                           ds.extent, ds.center_only).reshape(GRID, GRID)
+                           ds.extent, ds.center_only, ds.block).reshape(GRID, GRID)
     return img, mask
 
 
 def check(ds):
     bad = 0
+    B, G = ds.block, GRID // ds.block
     for t in ds.trials:
         img, mask = load(ds, t)
         colors, counts = np.unique(img.reshape(-1, 3), axis=0, return_counts=True)
         bg = colors[counts.argmax()]                              # most common color
         ink = np.abs(img - bg).sum(-1) > 0
         ink_patches = ink.reshape(GRID, PATCH_PX, GRID, PATCH_PX).any((1, 3))
+        # cell granularity: with BLOCK×BLOCK cells a small element need not
+        # ink every patch of its cell, but every masked CELL must contain ink
+        ink_cells = ink_patches.reshape(G, B, G, B).any((1, 3))
+        mask_cells = mask.reshape(G, B, G, B).any((1, 3))
         n = get(t, N_KEYS)
         errors = []
-        if mask.sum() != n:
-            errors.append(f"{mask.sum()} masked patches for {n} elements")
+        if mask.sum() != n * B * B:
+            errors.append(f"{mask.sum()} masked patches for {n} elements × {B * B}")
         if (ink_patches & ~mask).any():
             errors.append(f"ink outside mask in {int((ink_patches & ~mask).sum())} patches")
-        if (mask & ~ink_patches).any():
-            errors.append(f"{int((mask & ~ink_patches).sum())} masked patches without ink")
+        if (mask_cells & ~ink_cells).any():
+            errors.append(f"{int((mask_cells & ~ink_cells).sum())} masked cells without ink")
         if errors:
             bad += 1
             if bad <= 10:
                 print(f"  FAIL {t['filename']}: {'; '.join(errors)}")
     print(f"{len(ds.trials) - bad}/{len(ds.trials)} trials pass "
-          "(one element per patch, no element crosses a patch)")
+          f"(one element per {B}×{B}-patch cell, no element crosses its cell)")
     return bad == 0
 
 

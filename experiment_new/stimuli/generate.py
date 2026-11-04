@@ -26,11 +26,12 @@ on its side, as the paper's arithmetic mean) — to test discounting:
     gen.generate("stimuli_ori_discount_s42", n_reps=50, mode="discount")
 
 Layout (shared by all domains, tuned for DINOv2 ViT-B/14 at 224px):
-- elements sit on the 16x16 patch grid, at most one element per patch
-  (neighbouring patches allowed), anywhere on the grid;
+- elements sit on a grid of BLOCK×BLOCK-patch cells, at most one element
+  per cell (ori/hue: BLOCK=1 → 16×16 patches; size v2: BLOCK=2 → 8×8
+  cells of 28px, so elements are large enough to carry size information);
 - task-irrelevant jitter: element size per element, and center jitter
-  bounded so each element stays inside its own patch (the loader's patch
-  mask is then exact: one patch per element).
+  bounded so each element stays inside its own cell (the loader's mask is
+  then exact: one BLOCK×BLOCK cell per element).
 
 CLI (from experiment/):
     python3 stimuli/generate.py ori --seed 42 --n_reps 10     # → stimuli_ori_s42/
@@ -176,7 +177,8 @@ class EnsembleGenerator:
     MEANS: list = []
     SDS: list = []
     YLIM = (0, CANVAS)    # matplotlib y-axis orientation used for drawing
-    BORDER = 0            # empty patch rings at the image edge (2 reproduces ori v5)
+    BORDER = 0            # empty cell rings at the image edge (2 reproduces ori v5)
+    BLOCK = 1             # element cell = BLOCK×BLOCK patches (loader masks the cell)
     PERIOD = None         # 180 / 360 for circular statistics; None = linear (log size)
     # discount mode: outlier distance beyond the group's range edge (+ uniform jitter),
     # in the statistic's own units
@@ -207,23 +209,25 @@ class EnsembleGenerator:
         return (100 + 10 * self.LAYOUTS.index(layout) + self.DISTINCT.index(distinct),)
 
     def place(self, n, rng, outlier=None):
-        """n distinct patch centers (at most one element per patch).
+        """n distinct cell centers (at most one element per BLOCK×BLOCK cell).
         Spatial-outlier trials: the first n-1 (group) in a random quadrant,
         the last (outlier) in the diagonally opposite quadrant."""
+        G, C = GRID // self.BLOCK, PATCH * self.BLOCK
         if outlier is None or outlier[1] == "mixed":
             b = self.BORDER
-            cells = [(r, c) for r in range(b, GRID - b) for c in range(b, GRID - b)]
+            cells = [(r, c) for r in range(b, G - b) for c in range(b, G - b)]
+            assert n <= len(cells), f"N={n} does not fit the {G}×{G} cell grid"
             rng.shuffle(cells)
             cells = cells[:n]
         else:
-            h = GRID // 2
+            h = G // 2
             qr, qc = rng.integers(2, size=2)
             group = [(qr * h + r, qc * h + c) for r in range(h) for c in range(h)]
             far = [((1 - qr) * h + r, (1 - qc) * h + c) for r in range(h) for c in range(h)]
             assert n - 1 <= len(group), f"N={n} does not fit a quadrant"
             rng.shuffle(group)
             cells = group[:n - 1] + [far[rng.integers(len(far))]]
-        return np.array([[(c + 0.5) * PATCH, (r + 0.5) * PATCH]
+        return np.array([[(c + 0.5) * C, (r + 0.5) * C]
                          for r, c in cells], dtype=float)
 
     # ── statistic values (ori/hue: degrees, size: ln px) ───────────
@@ -288,12 +292,12 @@ class EnsembleGenerator:
                 "local_mean": lm, "local_sd": ls, "global_mean": gm, "global_sd": gs,
                 "global_mean_linear": float(lin % self.PERIOD if self.PERIOD else lin)}
 
-    @staticmethod
-    def jitter(positions, half_extent_xy, rng):
-        """Uniform center jitter keeping each element inside its patch.
+    def jitter(self, positions, half_extent_xy, rng):
+        """Uniform center jitter keeping each element inside its cell.
         half_extent_xy: (n, 2) half bounding-box size of each element."""
         out = positions.copy()
-        room = np.maximum(0.0, PATCH / 2 - half_extent_xy - POSITION_MARGIN)
+        room = np.maximum(0.0, PATCH * self.BLOCK / 2 - half_extent_xy
+                          - POSITION_MARGIN)
         for i, (jx, jy) in enumerate(room):
             out[i, 0] += rng.uniform(-jx, jx)
             out[i, 1] += rng.uniform(-jy, jy)
@@ -369,9 +373,37 @@ class EnsembleGenerator:
         print(f"  example grid → {path}")
 
     # ── dataset ────────────────────────────────────────────────────
+    def up_to_date(self, meta_path, n_reps, set_sizes, mode, layout):
+        """True if existing metadata already covers this request (same
+        generator version / seed / mode, at least as many reps and sizes)."""
+        if not meta_path.exists():
+            return False
+        p = json.loads(meta_path.read_text())["params"]
+        return (p.get("generator_version") == self.VERSION
+                and p.get("seed") == self.seed and p.get("mode") == mode
+                and p.get("n_repetitions", 0) >= n_reps
+                and set(set_sizes) <= set(p.get("set_sizes", []))
+                and (mode == "standard" or p.get("outlier_layout") == layout))
+
     def generate(self, out_dir, n_reps, set_sizes=SET_SIZES, checks=True,
                  mode="standard", layout="spatial"):
         out_dir = Path(out_dir)
+        if mode == "discount" and layout == "spatial":
+            # filter BEFORE the up-to-date check, which compares set_sizes
+            quad = (GRID // self.BLOCK // 2) ** 2          # cells per quadrant
+            fits = [n for n in set_sizes if n - 1 <= quad]
+            if fits != list(set_sizes):
+                print(f"{self.NAME}: spatial layout skips N="
+                      f"{sorted(set(set_sizes) - set(fits))} "
+                      f"(group of N-1 must fit a {quad}-cell quadrant)")
+                set_sizes = fits
+        if self.up_to_date(out_dir / "metadata.json", n_reps, set_sizes, mode, layout):
+            print(f"{self.NAME} {self.VERSION} [{mode}] seed={self.seed}: "
+                  f"{out_dir} is up to date, skipping (delete it to regenerate)")
+            return json.loads((out_dir / "metadata.json").read_text())
+        # reuse files only when the old metadata matches (a version change
+        # must overwrite same-named files)
+        reuse = self.up_to_date(out_dir / "metadata.json", 0, [], mode, layout)
         outliers = [None] if mode == "standard" else [(d, layout) for d in self.DISTINCT]
         sds = self.sds(mode)
         conditions = list(itertools.product(set_sizes, self.MEANS, sds, outliers))
@@ -388,7 +420,8 @@ class EnsembleGenerator:
                 # filename relative to out_dir (loader resolves against it)
                 fname = (f"n{n:02d}/mean{mean:03d}_sd{sd:03d}{tag}/"
                          f"stim_n{n:02d}_mean{mean:03d}_sd{sd:03d}{tag}_rep{rep:04d}.png")
-                self.render(t, out_dir / fname)
+                if not (reuse and (out_dir / fname).exists()):   # additive-reps rerun
+                    self.render(t, out_dir / fname)              # renders only new files
                 trials.append({"filename": fname, "repetition": rep, self.ELEMENT: n,
                                **self.trial_meta(t),
                                **(self.outlier_meta(t) if outlier else {})})
@@ -402,7 +435,8 @@ class EnsembleGenerator:
                        "set_sizes": list(set_sizes), "n_repetitions": n_reps,
                        "canvas_size": CANVAS, "patch_size": PATCH,
                        "border_patches": self.BORDER, "position_margin": POSITION_MARGIN,
-                       "elements_within_patch": True, "paths_relative_to": "metadata",
+                       "elements_within_patch": True, "patch_block": self.BLOCK,
+                       "paths_relative_to": "metadata",
                        "mode": mode,
                        **({"outlier_layout": layout, "outlier_delta": self.OUTLIER_DELTA,
                            "outlier_jitter": self.OUTLIER_JITTER,
@@ -508,9 +542,10 @@ class OrientationGenerator(EnsembleGenerator):
 
 class HueGenerator(EnsembleGenerator):
     """Colored shapes (fixed S, V) on an achromatic background; hue on [0, 360).
-    Task-irrelevant per element: shape, size (sqrt area), rotation."""
+    Task-irrelevant: shape per TRIAL (one shape per image, v5); size (sqrt
+    area) and rotation per element."""
 
-    NAME, ELEMENT, DOMAIN_TAG, VERSION = "hue", "n_circles", 2, "v4"
+    NAME, ELEMENT, DOMAIN_TAG, VERSION = "hue", "n_circles", 2, "v5"
     MEANS = [0, 60, 120, 180, 240, 300]
     SDS = [10, 20, 30]
     SATURATION, VALUE = 0.85, 0.90
@@ -535,7 +570,7 @@ class HueGenerator(EnsembleGenerator):
         rng = self.rng(n, mean, sd, rep, *self.okey(outlier))   # draw order fixed
         hues, sign = self.sample_values(mean, sd, n, rng, outlier)
         sizes = rng.uniform(*self.SIZE_RANGE, size=n)
-        shapes = [self.SHAPE_SET[i] for i in rng.integers(len(self.SHAPE_SET), size=n)]
+        shapes = [self.SHAPE_SET[rng.integers(len(self.SHAPE_SET))]] * n  # one per image
         rotations = rng.uniform(0, 360, size=n)
         pos = self.place(n, rng, outlier)
         pos = self.jitter(pos, shape_half_extent(shapes, sizes, rotations), rng)
@@ -569,8 +604,7 @@ class HueGenerator(EnsembleGenerator):
         cond = [f"{t['mean_hue']}_{t['variance_hue']}" for t in trials]
         print("Confound checks (nuisance should be independent of condition):")
         chi2_independence([t["bg_color_idx"] for t in trials], cond, "bg color")
-        chi2_independence([sh for t in trials for sh in t["shapes"]],
-                          [c for t, c in zip(trials, cond) for _ in t["shapes"]], "shape")
+        chi2_independence([t["shapes"][0] for t in trials], cond, "shape (per trial)")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -582,8 +616,13 @@ class SizeGenerator(EnsembleGenerator):
 
     size = sqrt(area) (px), so a circle, square, triangle and leaf of the same
     size have the same area. Size is sampled in log space — ln(size) ~ Normal,
-    the line analogue of the von Mises used on the orientation / hue circles
-    (Weber-like scaling: equal ratios are equally discriminable).
+    the line analogue of the von Mises used on the orientation / hue circles;
+    ratio spacing follows the mean-size literature (Ariely 2001; Chong &
+    Treisman 2003; Whitney & Yamanashi Leib 2018 AnnuRev).
+
+    v2: elements on an 8×8 grid of 2×2-patch cells (BLOCK = 2), ~2x every
+    size of v1 (whose adjacent mean levels differed by sub-pixel amounts);
+    one shape per image. Up to N = 32 of the 64 cells.
 
     Matched difficulty across domains: in every domain the mean step is
     6x / 3x / 2x the three SD levels (ori 30° vs 5/10/15°, hue 60° vs
@@ -592,15 +631,16 @@ class SizeGenerator(EnsembleGenerator):
     mean ± 3 SD stays inside [SIZE_MIN, max fitting size] for every condition.
 
     Condition codes (integers, used in RNG keys and filenames) are in
-    milli-ln units: mean code 930 → exp(0.93) = 2.53 px; SD code 25 → 0.025.
-    Task-irrelevant per element: shape, rotation; per trial: color pair.
+    milli-ln units: mean code 1640 → exp(1.64) = 5.16 px; SD code 25 → 0.025.
+    Task-irrelevant per element: rotation; per trial: shape, color pair.
     """
 
-    NAME, ELEMENT, DOMAIN_TAG, VERSION = "size", "n_items", 3, "v1"
-    MEANS = [930, 1080, 1230, 1380, 1530, 1680]   # ln(px)×1000: 2.53 … 5.37 px
+    NAME, ELEMENT, DOMAIN_TAG, VERSION = "size", "n_items", 3, "v2"
+    BLOCK = 2                                     # 2×2-patch cells, 8×8 grid
+    MEANS = [1640, 1790, 1940, 2090, 2240, 2390]  # ln(px)×1000: 5.16 … 10.91 px
     SDS = [25, 50, 75]                            # SD of ln(size) ×1000
     SHAPE_SET = ("circle", "square", "triangle", "leaf")
-    SIZE_MIN = 2.0                     # px; max is set by the patch (6.9 px with leaf)
+    SIZE_MIN = 4.0                    # px; max is set by the cell (13.8 px with leaf)
     N_COLORS, SATURATION, VALUE, MIN_CONTRAST = 15, 0.6, 0.85, 3.0
     # discount: "less" = ori's 15° under the 30°↔0.15 ln mapping; "more" would be
     # 0.45 ln but only 0.30 fits the size range (outlier goes to a side that fits)
@@ -612,7 +652,7 @@ class SizeGenerator(EnsembleGenerator):
         super().__init__(seed)
         self.colors, self.pairs = color_pairs(self.N_COLORS, self.SATURATION,
                                               self.VALUE, self.MIN_CONTRAST)
-        self.size_max = max_size(self.SHAPE_SET)
+        self.size_max = max_size(self.SHAPE_SET) * self.BLOCK   # cell, not patch
 
     def fmt_mean(self, m):
         return f"{np.exp(m / 1000):.2f}px"
@@ -644,7 +684,7 @@ class SizeGenerator(EnsembleGenerator):
         fg_idx, bg_idx = self.pairs[rng.integers(len(self.pairs))]
         ln_sizes, sign = self.sample_values(mean, sd, n, rng, outlier)
         sizes = np.exp(ln_sizes)
-        shapes = [self.SHAPE_SET[i] for i in rng.integers(len(self.SHAPE_SET), size=n)]
+        shapes = [self.SHAPE_SET[rng.integers(len(self.SHAPE_SET))]] * n  # one per image
         rotations = rng.uniform(0, 360, size=n)
         pos = self.place(n, rng, outlier)
         pos = self.jitter(pos, shape_half_extent(shapes, sizes, rotations), rng)
@@ -685,8 +725,7 @@ class SizeGenerator(EnsembleGenerator):
         print("Confound checks (nuisance should be independent of condition):")
         chi2_independence([t["fg_color_idx"] for t in trials], cond, "fg color")
         chi2_independence([t["bg_color_idx"] for t in trials], cond, "bg color")
-        chi2_independence([sh for t in trials for sh in t["shapes"]],
-                          [c for t, c in zip(trials, cond) for _ in t["shapes"]], "shape")
+        chi2_independence([t["shapes"][0] for t in trials], cond, "shape (per trial)")
 
 
 GENERATORS = {"ori": OrientationGenerator, "orientation": OrientationGenerator,
