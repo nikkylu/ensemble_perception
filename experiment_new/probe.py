@@ -31,8 +31,8 @@ file); nuisance levels stay defined by the condition labels.
 Regression (--target mean_reg / variance_reg): closed-form ridge reads the
 realized statistic WITHIN each (mean, SD) cell (λ by LOOCV); predictions
 pool across cells; reported per (slice, layer): Pearson r (in the "acc"
-slot) and MAE. The per_token slice regresses the display statistic from
-ONE element token (≤ 8 random slots; local-information cap r ≈ 1/√N).
+slot) and MAE. Runs on REG_SLICES (cls and bar) only — extend the tuple
+for the other slices.
 
 Efficiency: every (slice, layer, fold, λ) probe is an independent logistic
 regression; all of them are trained together in one vectorized full-batch
@@ -53,8 +53,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.model_selection import StratifiedKFold
-
-from loader import token_rows
 
 N_LAYERS = 12
 POOLED = ["cls", "bar", "bg", "all_patches"]
@@ -366,38 +364,28 @@ def pooled_metrics(ys, preds, n_folds):
     return r, mae
 
 
-def sweep_reg(features, idx_cells, dev, n=None, n_folds=5, seed=42):
+REG_SLICES = ("cls", "bar")   # the model's own summary vs the pooled elements
+
+
+def sweep_reg(features, idx_cells, dev, n_folds=5, seed=42):
     """Ridge-regress the realized deviation within each condition cell; pool
     test predictions over cells. idx_cells: list of trial-index tensors (one
     per target level at a fixed nuisance level).
     → {slice: {"acc": pearson r (12, F), "lam": None, "mae": (12,)}}"""
     out = {}
-    slices = {}
-    for st in POOLED:
-        slices[st] = lambda i, st=st: (features[st][i].float(), 1)
-    if "bar_concat" in features and n and n >= 2:
-        slices["pairwise_diff"] = lambda i: (compute_pairwise_diff(
-            features["bar_concat"][i].float(), n), 1)
-        slices["bar_concat"] = lambda i: (features["bar_concat"][i].float(), 1)
-        # aggregation control: one element token → the display's statistic
-        slices["per_token"] = lambda i: token_rows(
-            features["bar_concat"][i].float(), n, seed=seed)
-    for st, get in slices.items():
+    for st in REG_SLICES:
         ys = [[] for _ in range(n_folds)]
         preds = [[] for _ in range(n_folds)]
         for idx in idx_cells:
-            H, r_img = get(idx)
-            y = dev[idx].repeat_interleave(r_img)
-            groups = torch.arange(len(idx)).repeat_interleave(r_img)
-            te, pr = ridge_cell(H, y, n_folds, seed, groups=groups)
+            te, pr = ridge_cell(features[st][idx].float(), dev[idx], n_folds, seed)
             for f in range(n_folds):
-                ys[f].append(y[te[:, f]].numpy())
+                ys[f].append(dev[idx][te[:, f]].numpy())
                 preds[f].append(pr[te[:, f], :, f].numpy().T)
         ys = [np.concatenate(v) for v in ys]
         preds = [np.concatenate(v, axis=1) for v in preds]
         r, mae = pooled_metrics(ys, preds, n_folds)
         out[st] = {"acc": r, "lam": None, "mae": mae}
-    return {st: out[st] for st in SLICE_ORDER if st in out}
+    return out
 
 
 def sweep(features, target, idx, n=None, per_token=False, bg_concat=False,
@@ -548,7 +536,7 @@ def main():
             print(f"regressing realized {base} deviation over {len(cells)} cells, "
                   f"{len(d)} trials (deviation IQR "
                   f"{np.percentile(d, 75) - np.percentile(d, 25):.2f}{unit})")
-            per_level.append(sweep_reg(features, cells, dev, n=a.n_bars,
+            per_level.append(sweep_reg(features, cells, dev,
                                        n_folds=a.n_folds, seed=a.seed))
         else:
             idx = select_indices(features, a.n_bars, **{f"fix_{nuisance}": level})
