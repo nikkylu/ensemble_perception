@@ -62,16 +62,22 @@ def get(trial, keys):
     raise KeyError(f"none of {keys} in trial metadata")
 
 
-def token_rows(bar_concat, n, max_slots=8, seed=0):
-    """Single element tokens as separate rows: ≤ max_slots random element
-    slots of each display, trial-major. Relies on this module's block-major
-    concat order (the block² tokens of one element are adjacent).
-    (T, L, n·D) → ((T·k, L, D), k)"""
+def element_tokens(bar_concat, n, d):
+    """One d-dim vector per element: the block² patch tokens of each element
+    (adjacent in this module's block-major concat order) are averaged.
+    (T, L, n·block²·d) → (T, L, n, d); block=1 is a no-op reshape."""
     T, L, tot = bar_concat.shape
+    assert tot % (n * d) == 0, f"concat dim {tot} is not n={n} × block² × d={d}"
+    return bar_concat.reshape(T, L, n, tot // (n * d), d).mean(3)
+
+
+def token_rows(bar_concat, n, d, max_slots=8, seed=0):
+    """Single element vectors as separate rows: ≤ max_slots random element
+    slots of each display, trial-major. → ((T·k, L, d), k)"""
+    toks = element_tokens(bar_concat, n, d)
     k = min(n, max_slots)
     slots = torch.as_tensor(np.random.default_rng(seed).choice(n, k, replace=False))
-    toks = bar_concat.reshape(T, L, n, tot // n)[:, :, slots]
-    return toks.permute(0, 2, 1, 3).reshape(T * k, L, -1), k
+    return toks[:, :, slots].permute(0, 2, 1, 3).reshape(-1, toks.shape[1], d), k
 
 
 def pick_device():

@@ -54,6 +54,8 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import StratifiedKFold
 
+from loader import element_tokens
+
 N_LAYERS = 12
 POOLED = ["cls", "bar", "bg", "all_patches"]
 SLICE_ORDER = ["cls", "bar", "bg", "all_patches", "pairwise_diff", "bar_concat",
@@ -240,12 +242,10 @@ def probe_per_token(bar_concat, y, n, n_classes, **kw):
 # ONE SWEEP = all slices at one fixed nuisance level
 # ─────────────────────────────────────────────────────────────────
 
-def compute_pairwise_diff(bar_concat, n):
-    """Per-dim mean squared pairwise difference of element tokens,
-    mean_{i<j}(h_i - h_j)² = 2·Var_unbiased(h). (N, L, n·D) → (N, L, D)"""
-    N, L, total = bar_concat.shape
-    assert total % n == 0, f"bar_concat dim {total} not divisible by {n}"
-    return 2 * bar_concat.float().reshape(N, L, n, -1).var(dim=2, unbiased=True)
+def compute_pairwise_diff(bar_concat, n, d):
+    """Per-dim mean squared pairwise difference of element vectors,
+    mean_{i<j}(h_i - h_j)² = 2·Var_unbiased(h). (N, L, n·block²·d) → (N, L, d)"""
+    return 2 * element_tokens(bar_concat.float(), n, d).var(dim=2, unbiased=True)
 
 
 def select_indices(features, n_bars=None, fix_mean=None, fix_variance=None):
@@ -400,7 +400,8 @@ def sweep(features, target, idx, n=None, per_token=False, bg_concat=False,
     # all 768-d slices in one fit; concatenations separately
     pooled = {st: features[st][idx] for st in POOLED}
     if "bar_concat" in features and n and n >= 2:
-        pooled["pairwise_diff"] = compute_pairwise_diff(features["bar_concat"][idx], n)
+        pooled["pairwise_diff"] = compute_pairwise_diff(
+            features["bar_concat"][idx], n, features["cls"].shape[-1])
     results = probe_slices(pooled, y, n_classes, **kw)
     for st in ["bar_concat"] + (["bg_concat"] if bg_concat else []):
         if st in features:

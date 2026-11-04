@@ -43,7 +43,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from loader import token_rows
+from loader import element_tokens, token_rows
 
 N_LAYERS = 12
 SLICES = ["cls", "bar", "bg", "all_patches"]
@@ -120,17 +120,17 @@ def fit_readout(X, m, P, n_folds=5, seed=0, groups=None):
 # ─────────────────────────────────────────────────────────────────
 
 def slices(feats, n):
-    """{slice: (trials, L, D) float array}; bar_group drops the outlier
-    token, bar_outlier is the outlier's token alone (readout trained on
-    standard single tokens)."""
+    """{slice: (trials, L, D) float array}; bar_group drops the outlier's
+    element vector, bar_outlier is the outlier's element vector alone
+    (readout trained on standard single-element rows)."""
     out = {st: feats[st].float().numpy() for st in SLICES}
     if "bar_concat" in feats and "outlier_slot" in feats:
-        tok = feats["bar_concat"].float().reshape(len(feats["n_bars"]), N_LAYERS, n, -1)
+        tok = element_tokens(feats["bar_concat"].float(), n, feats["cls"].shape[-1])
+        slot = feats["outlier_slot"].long()
         keep = torch.ones(tok.shape[0], n, dtype=torch.bool)
-        keep[torch.arange(tok.shape[0]), feats["outlier_slot"]] = False
+        keep[torch.arange(tok.shape[0]), slot] = False
         out["bar_group"] = (tok * keep[:, None, :, None]).sum(2).div(n - 1).numpy()
-        out["bar_outlier"] = tok[torch.arange(tok.shape[0]), :,
-                                 feats["outlier_slot"]].numpy()
+        out["bar_outlier"] = tok[torch.arange(tok.shape[0]), :, slot].numpy()
     return out
 
 
@@ -155,7 +155,8 @@ def analyse(train, test):
     # bar_outlier is a single token: its readout trains on standard single tokens
     X_single = m_single = g_single = None
     if "bar_outlier" in X_test and "bar_concat" in train:
-        rows_tok, k = token_rows(train["bar_concat"].float(), int(train["n_bars"][0]))
+        rows_tok, k = token_rows(train["bar_concat"].float(),
+                                 int(train["n_bars"][0]), train["cls"].shape[-1])
         X_single = rows_tok.numpy()
         m_single = np.repeat(m_train, k)
         g_single = np.repeat(np.arange(len(m_train)), k)   # fold by display
