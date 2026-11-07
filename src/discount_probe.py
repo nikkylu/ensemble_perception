@@ -43,8 +43,8 @@ import numpy as np
 import torch
 from sklearn.model_selection import StratifiedKFold
 
-from discount import (encode, decode, diff, standardize, ridge_all, slices,
-                      LAMBDAS, N_LAYERS)
+from discount import N_LAYERS, slices
+from readout import LAMBDAS, decode, diff, encode, ridge_all, standardize
 
 TARGETS = ["local", "global", "global_circ"]
 N_FOLDS = 5

@@ -2,139 +2,92 @@
 
 Do vision transformers encode ensemble statistics? We probe frozen DINOv2
 (ViT-B/14) for the **mean** and **SD** of a set of elements' orientation, hue
-or size, across layers, token types and set sizes.
+or size, across layers, token slices and set sizes — and test whether an
+**outlier** is averaged in or discounted, mirroring Avci & Boduroglu (2021).
+
+## Repository map
 
 ```
-experiment/
-  stimuli/generate.py  stimulus generators (ori | hue | size), standard + discount mode
-  verify_mask.py       pixel check: one element per patch, none crossing a patch
-  loader.py            DINOv2 features per layer: CLS, element / background / all patches, concat
-  probe.py             linear probes, nested CV, all layers × slices in one vectorized fit
-  discount.py          outlier discounting: mean readout from standard → outlier displays
-  rsa.py               representational similarity analysis
-  plot_neurips.py      paper figures from probe logs
-  pipeline.sh          generate → verify → extract → probe
+src/
+  stimuli/generate.py  seed-deterministic stimulus generators (ori | hue | size),
+                       standard + discount mode; every display is a pure function
+                       of (seed, domain, N, μ, σ, rep)
+  verify_mask.py       pixel check: each element inside its own patch cell
+  loader.py            DINOv2 feature extraction per layer: CLS, element /
+                       background / all-patch pools, element-token concat
+  probe.py             classification probes (vectorized logistic, nested CV)
+                       and within-cell regression (closed-form ridge, exact LOOCV)
+  readout.py           shared continuous ridge readout (circular / linear targets)
+  discount.py          β: the outlier's weight in a standard-trained mean readout
+  discount_probe.py    local vs global mean decodability on discount displays
+  ideal_single.py      single-element ideal-observer ceilings for per_token
+  pipeline.sh          generate → verify → extract → probe → discount, all domains
 ```
 
 ## Quick start
 
 ```bash
-pip install -r Requirements.txt
-cd experiment
-./pipeline.sh                              # all domains × modes, seed 42, 50 reps
+pip install -r requirements.txt
+cd src
+./pipeline.sh                              # all domains × modes, seed 42, 200 reps
 ./pipeline.sh "ori hue" 7 50 "8 16"        # domains, seed, reps, set sizes
-MODES=standard ./pipeline.sh size          # only the standard stimuli
-python3 plot_neurips.py --results_dir results_s42
+MODES=standard ./pipeline.sh size          # restrict modes
 ```
 
-For every domain (ori, hue, size) and mode — `standard`, `discount_spatial`,
-`discount_mixed` — `pipeline.sh` generates the stimuli once, then for each set
-size N verifies the patch masks, extracts features and probes. Standard sets
-probe mean and SD for all N; discount sets (one SD level, N ≥ 3) probe the
-group mean and run the discount analysis. Outputs are keyed by seed:
+Stimuli are reused when up to date; features are re-extracted only when the
+stimuli are newer; probes rerun from cached features. Everything is keyed by
+seed and reruns byte-identically.
 
-| | path |
+| output | path (under `src/`) |
 |---|---|
 | stimuli | `stimuli_<domain>[_discount_<layout>]_s<seed>/` |
 | features | `features/<domain>_<mode>_n<N>_s<seed>.pt` |
-| standard results | `results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}` (read by `plot_neurips.py`) |
-| discount results | `results_s<seed>/<domain>_<mode>/n<N>_{mean_linear,discount}.{txt,json}` |
+| standard probes | `results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}` |
+| discount | `results_s<seed>/<domain>_<mode>/n<N>_{mean_linear,discount}.{txt,json}` |
 
-## Stimuli
+## Probing protocol (probe.py)
 
-Commands below run from `experiment/`.
+- **Targets** `mean` (6-way) and `variance` (3-way): labels are relabeled to
+  the level nearest each display's *realized* statistic, so the ceiling is
+  1.0 by construction; the nuisance statistic is held fixed per level.
+  `mean_reg` / `variance_reg` regress the realized statistic within each
+  (μ, σ) cell — the precision analysis below the 30° level spacing.
+- **Slices**: CLS, element tokens (pooled), background, all patches,
+  pairwise_diff (token variance), and `per_token` — one shared probe scored
+  on single element tokens. Its ceiling is not 1.0: compare against
+  `ideal_single.py` (above the ceiling ⇒ token mixing). The element-token
+  *concat* probe is reported only as a closed-form regression (supplement):
+  its logistic version confounds representation with p ≫ n estimation.
+- λ by nested CV (classification) or exact LOOCV (regression); outer test
+  folds never influence model selection.
 
-```bash
-python3 stimuli/generate.py ori --seed 42 --n_reps 50     # → stimuli_ori_s42/
-python3 stimuli/generate.py size --set_sizes 8,16
-```
-```python
-from stimuli.generate import OrientationGenerator
-gen = OrientationGenerator(seed=42)
-trial = gen.trial(n=16, mean=30, sd=10, rep=0)   # any rep: an infinite, reproducible stream
-```
+## Outlier discounting (discount mode)
 
-Each image is a pure function of `(seed, domain, N, mean, SD, rep)`: the same
-seed always gives the same stimuli, and a larger `--n_reps` adds new reps
-without changing existing ones.
+Displays hold N−1 group elements plus one outlier beyond the group's range
+edge ("less" / "more" distinct; spatial or mixed layout). Two analyses:
 
-| domain | elements | statistic | means | SDs | task-irrelevant |
-|---|---|---|---|---|---|
-| ori  | bars | orientation, von Mises (doubled angle) | 0…150°, step 30° | 5 / 10 / 15° | length, width, color pair |
-| hue  | circle, square, triangle | hue, von Mises | 0…300°, step 60° | 10 / 20 / 30° | shape, size, rotation, gray-level bg |
-| size | circle, square, triangle, leaf | ln √area, Gaussian | 2.5…5.4 px, step 0.15 ln | 0.025 / 0.05 / 0.075 ln | shape, rotation, color pair |
+- **`discount.py` — β**: a mean readout trained on standard displays is
+  applied to discount displays; β is the outlier's effective weight
+  (0 = discounted, 1 = averaged like any element), with trial-bootstrap CIs.
+  Compare β against β_circ, the value plain circular averaging would give —
+  for a 90° orientation outlier, β_circ ≈ −0.1, not 0.
+- **`discount_probe.py` — local vs global**: ridge readouts trained on the
+  discount displays themselves (nested CV), one per target (group-only mean,
+  arithmetic global mean, circular mean). Whether the global target is
+  decodable at all — and whether a global-trained probe's predictions stay
+  near the local mean — separates "the pooled vector is just an average"
+  from "element-resolved information survives pooling". `bar_group`
+  (outlier token removed by ground truth) is the no-information floor.
 
-- **Comparable difficulty:** in every domain the mean step is 6× / 3× / 2× the
-  SD levels, so the 6-way mean and 3-way SD tasks are equally hard in each
-  domain's own statistic space. Size is linear (the end levels have one
-  neighbour), and at fixed N mean size co-varies with total area; metadata
-  stores realized mean log size, mean size and mean area.
-- **Layout:** elements sit anywhere on the 16×16 patch grid, at most one per
-  patch, with jitter bounded so each element stays inside its patch.
+Size is the decisive domain: its statistic is linear, so "average everything"
+and "exclude the outlier" give different answers (circular domains let a 90° /
+180° outlier cancel itself, which mimics discounting). Discount cells whose
+size bounds admit only one outlier side are dropped at generation time —
+otherwise the outlier's direction is tied to the mean and readout shrinkage
+mimics outlier weighting.
 
-**Discount mode** (outliers, after Avci & Boduroglu, 2021, *APP* 83:1141):
+## Requirements
 
-```bash
-python3 stimuli/generate.py ori --mode discount                  # outlier in the opposite quadrant
-python3 stimuli/generate.py hue --mode discount --layout mixed   # outlier among the group
-```
-
-N−1 group elements (smallest SD; range capped at ori 30°, hue 60°, size
-0.15 ln) plus one outlier beyond the group's edge by a "less" (ori 15±3°) or
-"more" (ori 90±3°) distinct amount. Metadata and features keep local (group)
-and global means — global both circular and linear (the paper's arithmetic
-mean) — plus the outlier's value and its token slot in `bar_concat`.
-
-## Features
-
-```bash
-python3 loader.py --metadata stimuli_ori_s42/metadata.json --n_bars 16 --output feats.pt
-```
-
-Per layer (fp16): `cls`, `bar` (mean of element patches), `bg` (mean of
-background patches), `all_patches`, and — when one set size is extracted —
-`bar_concat` / `bg_concat` (tokens concatenated in raster order).
-
-## Probes
-
-```bash
-python3 probe.py --features feats.pt --target mean --n_bars 16
-python3 probe.py --features feats.pt --target variance --n_bars 16 --save res.json
-```
-
-- **Slices:** `cls`, `bar`, `bg`, `all_patches`, `pairwise_diff`
-  (per-dim mean squared difference between element tokens = 2·Var), `bar_concat`;
-  opt-in `--bg_concat`, `--per_token` (one probe shared by all element tokens,
-  scored per token and by averaging an image's token logits).
-- **Nuisance fixed:** the mean is probed separately at each SD level (and vice
-  versa); accuracies are averaged over levels, and the per-level table is
-  printed too (`--save` keeps every level's fold accuracies and λ).
-- **Nested CV:** outer 5 folds score; inside each outer training set an inner
-  CV picks the L2 strength λ (one per slice, at the middle layer;
-  `--lambda_select layer` for per-layer, `--weight_decay x` to fix it).
-  Features are standardized per fold.
-- **Two summaries:** `best` = max over layers (layer picked on the test folds,
-  optimistic) and `cv-best` = layer picked on the other folds (unbiased).
-- **Fast:** all layers × folds × λ × 768-d slices are independent logistic
-  regressions trained in one vectorized full-batch loop.
-
-## Discount analysis
-
-```bash
-python3 discount.py --train features/ori_standard_n8_s42.pt \
-                    --test features/ori_discount_spatial_n8_s42.pt
-```
-
-A ridge readout of the realized mean ((cos, sin) for ori / hue, ln size for
-size; λ by CV) is trained on the standard displays and applied to the outlier
-displays. Its outlier weight
-
-β = Σ (pred − local)(global − local) / Σ (global − local)²
-
-is 0 if the outlier is discounted and 1 if it is averaged like any element
-(global = the paper's arithmetic mean). **Compare β with β_circ**, the value
-pure circular averaging would give: a 90° orientation outlier is opposite in
-doubled-angle space, so circular averaging alone gives β_circ ≈ 0 for "more
-distinct" outliers. `bar_group` (group tokens only, outlier token removed)
-should give β ≈ 0 if tokens only encode their own element.
-
+Python ≥ 3.10, PyTorch (+ torchvision, downloads DINOv2 via torch.hub on
+first run), numpy, scipy, scikit-learn, matplotlib, pillow — see
+`requirements.txt`.

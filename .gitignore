@@ -31,3 +31,11 @@ Thumbs.db
 stimuli_*_s*/
 features/
 results_*/
+
+# local-only artifacts (slides, legacy data, node tooling)
+slides/
+experiment/
+node_modules/
+src/NOTES.md
+src/plot_*.py
+src/rsa.py
