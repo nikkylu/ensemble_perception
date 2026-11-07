@@ -81,6 +81,26 @@ for DOMAIN in $DOMAINS; do
         python3 discount.py --train $TRAIN --test $FEATS \
             --save $RES/n${N}_discount.json | tee $RES/n${N}_discount.txt
       fi
+      # aggregation-vs-computation controls (standard sets only): pre-block
+      # embeddings and one fixed untrained network (loader seeds @random)
+      if [[ $MODE == standard ]]; then
+        for CTL in emb random; do
+          CFEATS=features/${DOMAIN}_standard_n${N}_s${SEED}_${CTL}.pt
+          if [[ ! -f $CFEATS || $STIM/metadata.json -nt $CFEATS ]]; then
+            echo "=== $DOMAIN / standard / N=$N: $CTL control features ==="
+            python3 loader.py --metadata $STIM/metadata.json --n_bars $N \
+                --output $CFEATS --model dinov2_vitb14@${CTL}
+          fi
+          for TARGET in mean variance; do
+            [[ $N -eq 1 && $TARGET == variance ]] && continue
+            echo "=== $DOMAIN / standard / N=$N: probe $TARGET ($CTL control) ==="
+            python3 probe.py --features $CFEATS --target $TARGET --n_bars $N \
+                --seed $SEED --per_token \
+                --save $RES/n${N}_${TARGET}_${CTL}_linear.json \
+                | tee $RES/n${N}_${TARGET}_${CTL}_linear.txt
+          done
+        done
+      fi
     done
   done
 done

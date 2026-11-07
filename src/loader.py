@@ -293,6 +293,9 @@ def main():
                    help="hub model; append @random (untrained weights) or @emb "
                         "(pre-block patch embeddings, a single 'layer') for the "
                         "aggregation-vs-computation controls")
+    p.add_argument("--model_seed", type=int, default=0,
+                   help="seeds the @random initialization, so every domain and "
+                        "set size probes the SAME untrained network")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--device", default=pick_device())
     p.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
@@ -305,6 +308,7 @@ def main():
 
     dataset = StimuliDataset(a.metadata, a.n_bars)
     name, _, variant = a.model.partition("@")
+    torch.manual_seed(a.model_seed)   # one fixed @random network across runs
     model = torch.hub.load("facebookresearch/dinov2", name,
                            pretrained=variant != "random").to(a.device).eval()
     dtype = torch.float16 if a.precision == "fp16" else torch.float32
