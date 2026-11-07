@@ -72,7 +72,7 @@ for DOMAIN in $DOMAINS; do
       for TARGET in $TARGETS; do
         [[ $N -eq 1 && $TARGET == variance* ]] && continue   # one element has no SD
         echo "=== $DOMAIN / $MODE / N=$N: probe $TARGET ==="
-        python3 probe.py --features $FEATS --target $TARGET --n_bars $N --seed $SEED \
+        python3 probe.py --features $FEATS --target $TARGET --n_bars $N --seed $SEED --per_token \
             --save $RES/n${N}_${TARGET}_linear.json | tee $RES/n${N}_${TARGET}_linear.txt
       done
       TRAIN=features/${DOMAIN}_standard_n${N}_s${SEED}.pt

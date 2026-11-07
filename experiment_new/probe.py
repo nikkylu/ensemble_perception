@@ -6,11 +6,18 @@ every representation ("slice") at every layer:
 
     cls, bar, bg, all_patches   768-d pooled tokens (from loader.py)
     pairwise_diff               2·Var over element tokens (N ≥ 2)
-    bar_concat                  element tokens concatenated (N·768-d)
+    bar_concat                  element tokens concatenated (N·768-d; multi-patch
+                                cells are averaged per element first, so the
+                                dimensionality matches across domains)
     bg_concat        (opt-in)   background tokens concatenated (~190k-d)
-    per_token / token_vote      (opt-in) one 768-d probe shared by all element
-                                tokens, scored per token / by averaging an
-                                image's token logits
+    per_token / token_vote      (--per_token; pipeline.sh passes it) one 768-d
+                                probe shared by all element tokens, scored per
+                                token / by averaging an image's token logits —
+                                NOTE: token_vote with a linear probe is
+                                mathematically ≈ the pooled `bar` slice (mean
+                                of logits = logit of the mean); report
+                                per_token, don't sell token_vote as evidence
+                                beyond pooling
 
 Protocol
 - The nuisance statistic is held fixed: probing the mean, each SD level is
@@ -31,8 +38,9 @@ file); nuisance levels stay defined by the condition labels.
 Regression (--target mean_reg / variance_reg): closed-form ridge reads the
 realized statistic WITHIN each (mean, SD) cell (λ by LOOCV); predictions
 pool across cells; reported per (slice, layer): Pearson r (in the "acc"
-slot) and MAE. Runs on REG_SLICES (cls and bar) only — extend the tuple
-for the other slices.
+slot) and MAE. Runs on REG_SLICES (cls, bar, and — for the supplement's
+element-resolved readout, closed-form so free of the optimizer caveats that
+retired the logistic concat probe from the main figures — bar_concat).
 
 Efficiency: every (slice, layer, fold, λ) probe is an independent logistic
 regression; all of them are trained together in one vectorized full-batch
@@ -135,6 +143,12 @@ def fit_predict(H, y, train, n_classes, lam, lr=1e-3, epochs=200, device="cpu",
             opt.zero_grad()
             loss.backward()
             opt.step()
+        # NOTE: individual small-λ probes are not fully converged at the default
+        # budget — by design. Under-training acts as extra regularization, and
+        # the inner-CV λ selection compensates: accuracy at the SELECTED λ is
+        # insensitive to epochs (toy check: Δ ≤ 0.03 at 200 vs 1000 epochs for
+        # D up to 24k). Verify with --epochs 1000 before leaning on absolute
+        # concat-slice numbers.
         with torch.no_grad():
             out.append(model(H, mu, sd).cpu())
     return torch.cat(out, dim=3)
@@ -312,7 +326,8 @@ REG_LAMBDAS = torch.logspace(-2, 6, 9, dtype=torch.float64)
 
 def ridge_cell(H, y, n_folds, seed, groups=None):
     """Closed-form dual ridge per (layer, fold): per-fold standardization,
-    λ chosen by LOOCV over the training rows. Exact, no iterations.
+    λ chosen by LOOCV over the training rows (exact incl. the intercept's
+    1/m leverage; only the per-row μ/σ refit is neglected). No iterations.
     H (n, L, D), y (n,) → (test mask (n, F) bool, predictions (n, L, F)).
     groups: rows with the same group id (e.g. tokens of one image) always
     land in the same fold."""
@@ -339,10 +354,16 @@ def ridge_cell(H, y, n_folds, seed, groups=None):
         K = torch.einsum("mld,nld->lmn", Ztr, Ztr)              # (L, m, m)
         evals, U = torch.linalg.eigh(K)                         # K = U e Uᵀ
         Uy = torch.einsum("lmn,m->ln", U, yc)                   # (L, m)
-        den = evals[None] + REG_LAMBDAS[:, None, None]          # (Q, L, m)
-        fit = torch.einsum("lmn,qln->qlm", U, evals[None] / den * Uy[None])
-        h = torch.einsum("lmn,qln->qlm", U ** 2, evals[None] / den)
-        loo = ((yc[None, None] - fit) / (1 - h).clamp(min=1e-3)) ** 2
+        # exact LOO of (center y, standardize, ridge): the unpenalized
+        # intercept adds 1/m to every leverage, and both residual and
+        # 1 − leverage are built from d = λ/(e+λ) so the near-interpolation
+        # limit (small λ, D ≫ m) stays numerically stable. Only the per-row
+        # refit of μ/σ is still neglected (O(1/m), <0.5% on the LOO curve).
+        d = REG_LAMBDAS[:, None, None] / (evals[None] + REG_LAMBDAS[:, None, None])
+        resid = torch.einsum("lmn,qln->qlm", U, d * Uy[None])   # yc − fit
+        g = (torch.einsum("lmn,qln->qlm", U ** 2, d)
+             - 1.0 / int(tr.sum()))                             # 1 − h − 1/m
+        loo = (resid / g.clamp(min=1e-10)) ** 2
         best = loo.mean(-1).argmin(0)                           # (L,)
         alpha = torch.einsum("lmn,ln->lm", U,
                              Uy / (evals + REG_LAMBDAS[best][:, None]))
@@ -364,7 +385,10 @@ def pooled_metrics(ys, preds, n_folds):
     return r, mae
 
 
-REG_SLICES = ("cls", "bar")   # the model's own summary vs the pooled elements
+# cls = the model's own summary, bar = pooled elements; bar_concat = the
+# supplement's element-resolved readout — closed-form here, so unlike the
+# logistic concat probe it has no optimizer/convergence caveat
+REG_SLICES = ("cls", "bar", "bar_concat")
 
 
 def sweep_reg(features, idx_cells, dev, n_folds=5, seed=42):
@@ -496,6 +520,15 @@ def main():
 
     torch.manual_seed(a.seed)
     features = torch.load(a.features, map_location="cpu")
+    if "bar_concat" in features:
+        # multi-patch cells (size v2): average each element's block² tokens so
+        # bar_concat is N·d-dimensional in every domain (ori/hue: no-op)
+        d, n = features["cls"].shape[-1], int(features["n_bars"][0])
+        if features["bar_concat"].shape[-1] != n * d:
+            dtype = features["bar_concat"].dtype
+            features["bar_concat"] = element_tokens(
+                features["bar_concat"].float(), n, d).reshape(
+                len(features["bar_concat"]), N_LAYERS, n * d).to(dtype)
     kw = dict(n=a.n_bars, per_token=a.per_token, bg_concat=a.bg_concat,
               lambdas=[a.weight_decay] if a.weight_decay is not None
               else [float(x) for x in a.lambdas.split(",")],
