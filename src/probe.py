@@ -123,10 +123,13 @@ def fit_predict(H, y, train, n_classes, lam, max_iter=1500, device="cpu",
 
     H (N, L, D), y (N,), train (N, S) 0/1 mask, lam broadcastable to (L, S, Q).
     Each probe minimizes mean CE over its training rows + ½λ‖W‖² (bias free),
-    by full-batch L-BFGS from zero weights (strong-Wolfe line search; the cap
-    is max_iter — accuracy and chosen λ were verified stable between caps of
-    1500 and 3000 on the cluster). λ is processed in chunks so at most
-    `max_params` weights live at once.
+    by full-batch L-BFGS from zero weights (strong-Wolfe line search;
+    tolerance_change=0 so the fit never stops early on the SUMMED loss —
+    only on the gradient test, which bounds every probe, or at max_iter;
+    cap equivalence 1500 vs 3000 verified on size mean N=4, within 0.004).
+    Each fit prints its iteration count and the largest per-probe gradient
+    norm, so a full run documents its own convergence. λ is processed in
+    chunks so at most `max_params` weights live at once.
     → logits (N, L, S, Q, C) on CPU.
     """
     H, y, train = H.to(device), y.to(device), train.to(device)
@@ -143,7 +146,8 @@ def fit_predict(H, y, train, n_classes, lam, max_iter=1500, device="cpu",
         lq = lam[:, :, q:q + chunk]
         model = VectorizedLinearProbes(L, S, lq.shape[-1], D, n_classes).to(device)
         opt = torch.optim.LBFGS(model.parameters(), max_iter=max_iter,
-                                history_size=10, line_search_fn="strong_wolfe")
+                                history_size=20, tolerance_change=0,
+                                tolerance_grad=1e-5, line_search_fn="strong_wolfe")
         target = y.view(N, 1, 1, 1, 1).expand(N, L, S, lq.shape[-1], 1)
 
         def closure():
@@ -155,6 +159,12 @@ def fit_predict(H, y, train, n_classes, lam, max_iter=1500, device="cpu",
             return loss
 
         opt.step(closure)
+        closure()                                   # grads at the final point
+        g = (model.W.grad.pow(2).sum((-2, -1))
+             + model.b.grad.pow(2).sum(-1)).sqrt()  # per-probe ‖∇‖ (L, S, Q)
+        it = opt.state_dict()["state"][0]["n_iter"]
+        print(f"  L-BFGS: {it}/{max_iter} iters, max per-probe ‖∇‖ "
+              f"{g.max():.1e} over {g.numel()} probes")
         with torch.no_grad():
             out.append(model(H, mu, sd).cpu())
     return torch.cat(out, dim=3)
