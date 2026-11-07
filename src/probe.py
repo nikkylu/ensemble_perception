@@ -43,9 +43,13 @@ element-resolved readout, closed-form so free of the optimizer caveats that
 retired the logistic concat probe from the main figures — bar_concat).
 
 Efficiency: every (slice, layer, fold, λ) probe is an independent logistic
-regression; all of them are trained together in one vectorized full-batch
-Adam loop. Per-probe losses are summed, so each probe gets exactly the
-gradient it would get alone.
+regression; all of them are solved together in one vectorized full-batch
+L-BFGS run (strong-Wolfe line search, zero init). Per-probe losses are
+summed; the problems stay independent because the gradient is
+block-separable. Adam at a fixed epoch budget was retired after an
+L-BFGS comparison on the cluster showed it under-reports pooled slices
+by 5-14 points on size - and an under-converged probe is not comparable
+across feature scales (pretrained vs @emb / @random controls).
 
 Usage:
     python3 probe.py --features feats.pt --target mean --n_bars 16
@@ -92,10 +96,11 @@ class VectorizedLinearProbes(nn.Module):
 
     def __init__(self, n_layers, n_splits, n_lambdas, dim, n_classes):
         super().__init__()
-        k = 1.0 / np.sqrt(dim)  # nn.Linear init range
         shape = (n_layers, n_splits, n_lambdas)
-        self.W = nn.Parameter(torch.empty(*shape, dim, n_classes).uniform_(-k, k))
-        self.b = nn.Parameter(torch.empty(*shape, n_classes).uniform_(-k, k))
+        # zero init: the CE objective is convex, so the solution is unique and
+        # the whole fit is deterministic
+        self.W = nn.Parameter(torch.zeros(*shape, dim, n_classes))
+        self.b = nn.Parameter(torch.zeros(*shape, n_classes))
 
     def forward(self, H, mu, sd):
         """H (N, L, D), mu/sd (L, S, D) → logits (N, L, S, Q, C)"""
@@ -112,13 +117,16 @@ def split_statistics(H, train):
     return mu, var.clamp(min=0).sqrt() + 1e-6
 
 
-def fit_predict(H, y, train, n_classes, lam, lr=1e-3, epochs=200, device="cpu",
+def fit_predict(H, y, train, n_classes, lam, max_iter=1500, device="cpu",
                 max_params=4e7):
-    """Train one probe per (layer, split, λ), full batch; return logits for all rows.
+    """Solve one probe per (layer, split, λ) to convergence; logits for all rows.
 
     H (N, L, D), y (N,), train (N, S) 0/1 mask, lam broadcastable to (L, S, Q).
-    Each probe minimizes mean CE over its training rows + ½λ‖W‖² (bias free).
-    λ is processed in chunks so at most `max_params` weights live at once.
+    Each probe minimizes mean CE over its training rows + ½λ‖W‖² (bias free),
+    by full-batch L-BFGS from zero weights (strong-Wolfe line search; the cap
+    is max_iter — accuracy and chosen λ were verified stable between caps of
+    1500 and 3000 on the cluster). λ is processed in chunks so at most
+    `max_params` weights live at once.
     → logits (N, L, S, Q, C) on CPU.
     """
     H, y, train = H.to(device), y.to(device), train.to(device)
@@ -134,15 +142,19 @@ def fit_predict(H, y, train, n_classes, lam, lr=1e-3, epochs=200, device="cpu",
     for q in range(0, lam.shape[-1], chunk):
         lq = lam[:, :, q:q + chunk]
         model = VectorizedLinearProbes(L, S, lq.shape[-1], D, n_classes).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        opt = torch.optim.LBFGS(model.parameters(), max_iter=max_iter,
+                                history_size=10, line_search_fn="strong_wolfe")
         target = y.view(N, 1, 1, 1, 1).expand(N, L, S, lq.shape[-1], 1)
-        for _ in range(epochs):
+
+        def closure():
+            opt.zero_grad()
             ce = -model(H, mu, sd).log_softmax(-1).gather(-1, target).squeeze(-1)
             data = (ce * train.view(N, 1, S, 1)).sum(0) / n_train       # (L, S, Q)
             loss = data.sum() + 0.5 * (lq * model.W.pow(2).sum((-2, -1))).sum()
-            opt.zero_grad()
             loss.backward()
-            opt.step()
+            return loss
+
+        opt.step(closure)
         with torch.no_grad():
             out.append(model(H, mu, sd).cpu())
     return torch.cat(out, dim=3)
@@ -507,8 +519,8 @@ def main():
     p.add_argument("--per_token", action="store_true", help="add per-token / token-vote")
     p.add_argument("--bg_concat", action="store_true",
                    help="add concatenated background tokens (slow: ~190k-d)")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--max_iter", type=int, default=1500,
+                   help="L-BFGS iteration cap (1500 vs 3000 verified equivalent)")
     p.add_argument("--device", default=pick_device())
     p.add_argument("--seed", type=int, default=42, help="CV splits and probe init")
     p.add_argument("--save", default=None, help="JSON: fold accuracies + λ per level")
@@ -529,7 +541,7 @@ def main():
               lambdas=[a.weight_decay] if a.weight_decay is not None
               else [float(x) for x in a.lambdas.split(",")],
               select=a.lambda_select, ref_layer=a.lambda_layer, n_folds=a.n_folds,
-              inner_folds=a.inner_folds, seed=a.seed, lr=a.lr, epochs=a.epochs,
+              inner_folds=a.inner_folds, seed=a.seed, max_iter=a.max_iter,
               device=a.device)
 
     # the nuisance statistic is held fixed at each of its levels (or one level)
