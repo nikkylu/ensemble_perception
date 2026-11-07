@@ -143,17 +143,6 @@ def fit_predict(H, y, train, n_classes, lam, lr=1e-3, epochs=200, device="cpu",
             opt.zero_grad()
             loss.backward()
             opt.step()
-        # NOTE: individual small-λ probes are not fully converged at the default
-        # budget — by design: under-training acts as extra regularization and
-        # the inner-CV λ selection sweeps that axis anyway. Evidence that the
-        # SELECTED-λ accuracy is epoch-insensitive, in decreasing strength:
-        # (1) the mechanism above; (2) real data, pooled slices × mean target
-        # only: ori/hue track the relabel ceiling within 0.02 at every N, which
-        # an under-converged probe could not; (3) a synthetic check (Δ ≤ 0.03
-        # at 200 vs 1000 epochs up to D = 24k) — NOT yet confirmed on real
-        # data; the cluster L-BFGS comparison (size mean N=4/32, hue variance
-        # N=32) is that confirmation. Until it lands, treat variance-target and
-        # high-D numbers as lower bounds and re-check with --epochs 1000.
         with torch.no_grad():
             out.append(model(H, mu, sd).cpu())
     return torch.cat(out, dim=3)
@@ -216,8 +205,9 @@ def nested_cv(H, y, n_classes, n_slices=1, rows_per_image=1, lambdas=(1e-2,),
         k = min(inner_folds, int(np.bincount(y.numpy()).min() * (n_folds - 1) // n_folds))
         itr, iva = inner_fold_masks(y, tr, k, seed)
         per = L // n_slices
+        ref = min(ref_layer, per - 1)
         layers = (list(range(L)) if select == "layer"
-                  else [s * per + ref_layer for s in range(n_slices)])
+                  else [s * per + ref for s in range(n_slices)])
         lg = fit_predict(H[:, layers], y_rows, rows(itr), n_classes,
                          lambdas.view(1, 1, -1), **fit)
         val = accuracy(lg, y_rows, rows(iva))                         # (·, F·k, Q)
@@ -236,10 +226,10 @@ def probe_slices(slices, y, n_classes, **kw):
     → {name: {"acc": (12, F), "lam": (12, F)}}"""
     names = list(slices)
     H = torch.cat([slices[n].float() for n in names], dim=1)
+    L = H.shape[1] // len(names)
     lg, te, lam = nested_cv(H, y, n_classes, n_slices=len(names), **kw)
     acc = accuracy(lg, y, te)
-    return {n: {"acc": acc[i * N_LAYERS:(i + 1) * N_LAYERS],
-                "lam": lam[i * N_LAYERS:(i + 1) * N_LAYERS]}
+    return {n: {"acc": acc[i * L:(i + 1) * L], "lam": lam[i * L:(i + 1) * L]}
             for i, n in enumerate(names)}
 
 
@@ -380,7 +370,7 @@ def ridge_cell(H, y, n_folds, seed, groups=None):
 def pooled_metrics(ys, preds, n_folds):
     """ys: per fold, list of (P,); preds: per fold, list of (L, P).
     → r (L, F) Pearson over the fold's pooled cells, mae (L,) over everything."""
-    r = np.zeros((N_LAYERS, n_folds))
+    r = np.zeros((preds[0].shape[0], n_folds))
     for f in range(n_folds):
         yt, yp = ys[f] - ys[f].mean(), preds[f] - preds[f].mean(1, keepdims=True)
         r[:, f] = (yp @ yt) / np.maximum(np.linalg.norm(yp, axis=1)
@@ -463,7 +453,8 @@ def print_rows(results):
 def print_summary(results):
     """Slices × layers, with best (optimistic), cv-best (unbiased) and median λ."""
     print("=" * 80)
-    print(f"{'':14s}" + "  ".join(f"L{l:02d}" for l in range(N_LAYERS)))
+    n_l = len(next(iter(results.values()))["acc"])
+    print(f"{'':14s}" + "  ".join(f"L{l:02d}" for l in range(n_l)))
     for st, r in results.items():
         m = r["acc"].mean(1)
         lam = f", λ≈{np.median(r['lam']):.0e}" if r.get("lam") is not None else ""
@@ -533,7 +524,7 @@ def main():
             dtype = features["bar_concat"].dtype
             features["bar_concat"] = element_tokens(
                 features["bar_concat"].float(), n, d).reshape(
-                len(features["bar_concat"]), N_LAYERS, n * d).to(dtype)
+                len(features["bar_concat"]), -1, n * d).to(dtype)
     kw = dict(n=a.n_bars, per_token=a.per_token, bg_concat=a.bg_concat,
               lambdas=[a.weight_decay] if a.weight_decay is not None
               else [float(x) for x in a.lambdas.split(",")],
