@@ -48,6 +48,7 @@ from loader import element_tokens, token_rows
 N_LAYERS = 12
 SLICES = ["cls", "bar", "bg", "all_patches"]
 LAMBDAS = np.logspace(-2, 4, 13)
+N_BOOT = 1000
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -115,6 +116,19 @@ def fit_readout(X, m, P, n_folds=5, seed=0, groups=None):
             err[q] / len(X), float(LAMBDAS[q]))
 
 
+def bootstrap_beta(p_off, g_off, c_off, n_boot=N_BOOT, seed=0):
+    """Trial-level bootstrap (resample displays with replacement; the readout
+    stays fixed). 95% CIs of β and of β − β_circ — the latter is the paired
+    test against plain averaging."""
+    idx = np.random.default_rng(seed).integers(0, len(p_off), (n_boot, len(p_off)))
+    G = g_off[idx]
+    den = (G ** 2).sum(1)
+    beta = (p_off[idx] * G).sum(1) / den
+    dcirc = beta - (c_off[idx] * G).sum(1) / den
+    return ([float(q) for q in np.percentile(beta, [2.5, 97.5])],
+            [float(q) for q in np.percentile(dcirc, [2.5, 97.5])])
+
+
 # ─────────────────────────────────────────────────────────────────
 # analysis
 # ─────────────────────────────────────────────────────────────────
@@ -178,9 +192,12 @@ def analyse(train, test):
                 p_off = diff(pred[sel], local[sel], P)
                 g_off = diff(glob[sel], local[sel], P)
                 c_off = diff(circ[sel], local[sel], P)
+                beta_ci, dcirc_ci = bootstrap_beta(p_off, g_off, c_off)
                 row[name] = {
                     "beta": float((p_off * g_off).sum() / (g_off ** 2).sum()),
                     "beta_circ": float((c_off * g_off).sum() / (g_off ** 2).sum()),
+                    "beta_ci": beta_ci,
+                    "beta_minus_circ_ci": dcirc_ci,
                     "err_local": float(np.abs(p_off).mean()),
                     "err_global": float(np.abs(diff(pred[sel], glob[sel], P)).mean()),
                     "local_global_gap": float(np.abs(g_off).mean())}
@@ -204,13 +221,18 @@ def print_table(res, unit):
     print(f"circular-averaging baseline: β_circ less {r0['less']['beta_circ']:+.2f}, "
           f"more {r0['more']['beta_circ']:+.2f}")
     # summary at each slice's most accurate layer on the standard stimuli
-    print("at the layer with the lowest standard cv err:")
+    print("at the layer with the lowest standard cv err "
+          "(trial-bootstrap 95% CI; * : β−β_circ CI excludes 0):")
     for st, rows in res.items():
         b = int(np.argmin([r["cv_err"] for r in rows]))
-        print(f"  {st:12s} L{b:02d}  cv err {rows[b]['cv_err']:.3g}   "
-              f"β less {rows[b]['less']['beta']:+.2f}   β more {rows[b]['more']['beta']:+.2f}   "
-              f"(local–global gap: less {rows[b]['less']['local_global_gap']:.3g}, "
-              f"more {rows[b]['more']['local_global_gap']:.3g})")
+        parts = [f"  {st:12s} L{b:02d}  cv err {rows[b]['cv_err']:.3g}  "]
+        for d in ["less", "more"]:
+            r = rows[b][d]
+            lo, hi = r.get("beta_ci", (np.nan, np.nan))
+            sig = "*" if "beta_minus_circ_ci" in r and (
+                r["beta_minus_circ_ci"][0] > 0 or r["beta_minus_circ_ci"][1] < 0) else " "
+            parts.append(f"β {d} {r['beta']:+.2f} [{lo:+.2f},{hi:+.2f}]{sig}  ")
+        print("".join(parts))
 
 
 def main():
