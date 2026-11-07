@@ -247,6 +247,19 @@ class EnsembleGenerator:
         """Allowed value range for linear statistics (outlier must stay inside)."""
         return -np.inf, np.inf
 
+    def stat_mean(self, mean):
+        """Condition mean in statistic space (deg; ln px for size)."""
+        return float(mean)
+
+    def both_sides_fit(self, mean, distinct):
+        """Discount mode: can the outlier go to either side of the group at
+        this mean? One-sided cells tie the outlier's direction to the mean —
+        a readout-shrinkage bias then mimics outlier weighting — so generate()
+        drops them. Circular statistics have no walls: always True."""
+        lo, hi = self.bounds()
+        d = self.OUTLIER_DELTA[distinct] + self.OUTLIER_JITTER
+        return lo + d <= self.stat_mean(mean) <= hi - d
+
     def deviations(self, v, m):
         """Signed deviations of v from m (wrapped to ±PERIOD/2 if circular)."""
         P = self.PERIOD
@@ -406,7 +419,14 @@ class EnsembleGenerator:
         reuse = self.up_to_date(out_dir / "metadata.json", 0, [], mode, layout)
         outliers = [None] if mode == "standard" else [(d, layout) for d in self.DISTINCT]
         sds = self.sds(mode)
-        conditions = list(itertools.product(set_sizes, self.MEANS, sds, outliers))
+        conditions = [c for c in itertools.product(set_sizes, self.MEANS, sds, outliers)
+                      if c[3] is None or self.both_sides_fit(c[1], c[3][0])]
+        dropped = sorted({(m, o[0]) for _, m, _, o in
+                          itertools.product(set_sizes, self.MEANS, sds, outliers)
+                          if o is not None and not self.both_sides_fit(m, o[0])})
+        for m, d in dropped:
+            print(f"  dropping mean={m} '{d}': outlier fits on one side only "
+                  f"(direction would be tied to the mean)")
         total = len(conditions) * n_reps
         print(f"{self.NAME} {self.VERSION} [{mode}]  seed={self.seed}  N={list(set_sizes)}  "
               f"means={self.MEANS}  sds={sds}  reps={n_reps}  "
@@ -635,16 +655,20 @@ class SizeGenerator(EnsembleGenerator):
     Task-irrelevant per element: rotation; per trial: shape, color pair.
     """
 
-    NAME, ELEMENT, DOMAIN_TAG, VERSION = "size", "n_items", 3, "v2"
+    # v3: SD levels ×2.4 and larger shapes (circle/square only, means shifted up)
+    # so the variance signal clears DINOv2's ≈0.5 px per-element size noise
+    # floor, which left v2's variance probes at chance (sub-pixel deviations)
+    NAME, ELEMENT, DOMAIN_TAG, VERSION = "size", "n_items", 3, "v3"
     BLOCK = 2                                     # 2×2-patch cells, 8×8 grid
-    MEANS = [1640, 1790, 1940, 2090, 2240, 2390]  # ln(px)×1000: 5.16 … 10.91 px
-    SDS = [25, 50, 75]                            # SD of ln(size) ×1000
-    SHAPE_SET = ("circle", "square", "triangle", "leaf")
-    SIZE_MIN = 4.0                    # px; max is set by the cell (13.8 px with leaf)
+    MEANS = [1790, 1940, 2090, 2240, 2390, 2540]  # ln(px)×1000: 5.99 … 12.68 px
+    SDS = [60, 120, 180]                          # SD of ln(size) ×1000
+    SHAPE_SET = ("circle", "square")
+    SIZE_MIN = 4.0                    # px; max is set by the cell (17.0 px with square)
     N_COLORS, SATURATION, VALUE, MIN_CONTRAST = 15, 0.6, 0.85, 3.0
-    # discount: "less" = ori's 15° under the 30°↔0.15 ln mapping; "more" would be
-    # 0.45 ln but only 0.30 fits the size range (outlier goes to a side that fits)
-    OUTLIER_DELTA = {"less": 0.075, "more": 0.30}
+    # discount: ori's 15° / 90° under the 30° ↔ 0.15 ln mapping. Means whose
+    # bounds admit only one outlier side are dropped per distinctness
+    # (both_sides_fit): "more" runs on the interior means only
+    OUTLIER_DELTA = {"less": 0.075, "more": 0.45}
     OUTLIER_JITTER = 0.015
     MAX_GROUP_RANGE = 0.15                         # ori's 30° under 30° ↔ 0.15 ln
 
@@ -678,6 +702,9 @@ class SizeGenerator(EnsembleGenerator):
 
     def bounds(self):
         return np.log(self.SIZE_MIN), np.log(self.size_max)
+
+    def stat_mean(self, mean):
+        return mean / 1000                        # milli-ln codes → ln px
 
     def trial(self, n, mean, sd, rep, outlier=None):
         rng = self.rng(n, mean, sd, rep, *self.okey(outlier))   # draw order fixed
