@@ -144,11 +144,16 @@ def fit_predict(H, y, train, n_classes, lam, lr=1e-3, epochs=200, device="cpu",
             loss.backward()
             opt.step()
         # NOTE: individual small-λ probes are not fully converged at the default
-        # budget — by design. Under-training acts as extra regularization, and
-        # the inner-CV λ selection compensates: accuracy at the SELECTED λ is
-        # insensitive to epochs (toy check: Δ ≤ 0.03 at 200 vs 1000 epochs for
-        # D up to 24k). Verify with --epochs 1000 before leaning on absolute
-        # concat-slice numbers.
+        # budget — by design: under-training acts as extra regularization and
+        # the inner-CV λ selection sweeps that axis anyway. Evidence that the
+        # SELECTED-λ accuracy is epoch-insensitive, in decreasing strength:
+        # (1) the mechanism above; (2) real data, pooled slices × mean target
+        # only: ori/hue track the relabel ceiling within 0.02 at every N, which
+        # an under-converged probe could not; (3) a synthetic check (Δ ≤ 0.03
+        # at 200 vs 1000 epochs up to D = 24k) — NOT yet confirmed on real
+        # data; the cluster L-BFGS comparison (size mean N=4/32, hue variance
+        # N=32) is that confirmation. Until it lands, treat variance-target and
+        # high-D numbers as lower bounds and re-check with --epochs 1000.
         with torch.no_grad():
             out.append(model(H, mu, sd).cpu())
     return torch.cat(out, dim=3)
