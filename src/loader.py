@@ -234,7 +234,7 @@ def masked_concat(tokens, mask):
 
 @torch.no_grad()
 def extract(model, dataset, device, batch_size=32, out_dtype=torch.float16,
-            bg_concat=False):
+            bg_concat=False, embedding=False):
     # concatenated slices are only well-defined when every trial has the
     # same number of element patches; bg_concat (~190k-d) dominates the
     # file size, so it is opt-in (as in probe.py)
@@ -253,8 +253,12 @@ def extract(model, dataset, device, batch_size=32, out_dtype=torch.float16,
     filenames = []
 
     for images, masks, lm, lv, n, names in loader:
-        layers = model.get_intermediate_layers(
-            images.to(device), n=N_LAYERS, return_class_token=True)
+        if embedding:   # pre-block control: patch embed + positions, one "layer"
+            tok = model.prepare_tokens_with_masks(images.to(device))
+            layers = [(tok[:, 1:], tok[:, 0])]
+        else:
+            layers = model.get_intermediate_layers(
+                images.to(device), n=N_LAYERS, return_class_token=True)
         masks = masks[:, perm]
         per_layer = {k: [] for k in keys}
         for patches, cls in layers:
@@ -285,7 +289,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--metadata", required=True)
     p.add_argument("--output", default="features.pt")
-    p.add_argument("--model", default="dinov2_vitb14")
+    p.add_argument("--model", default="dinov2_vitb14",
+                   help="hub model; append @random (untrained weights) or @emb "
+                        "(pre-block patch embeddings, a single 'layer') for the "
+                        "aggregation-vs-computation controls")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--device", default=pick_device())
     p.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
@@ -297,9 +304,12 @@ def main():
     a = p.parse_args()
 
     dataset = StimuliDataset(a.metadata, a.n_bars)
-    model = torch.hub.load("facebookresearch/dinov2", a.model).to(a.device).eval()
+    name, _, variant = a.model.partition("@")
+    model = torch.hub.load("facebookresearch/dinov2", name,
+                           pretrained=variant != "random").to(a.device).eval()
     dtype = torch.float16 if a.precision == "fp16" else torch.float32
-    feats = extract(model, dataset, a.device, a.batch_size, dtype, a.bg_concat)
+    feats = extract(model, dataset, a.device, a.batch_size, dtype, a.bg_concat,
+                    embedding=variant == "emb")
 
     for k, v in feats.items():
         if isinstance(v, torch.Tensor):

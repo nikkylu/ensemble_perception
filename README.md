@@ -61,6 +61,26 @@ seed and reruns byte-identically.
 - λ by nested CV (classification) or exact LOOCV (regression); outer test
   folds never influence model selection.
 
+### Aggregation-vs-computation controls
+
+The pooled slices average tokens as part of the *analysis*, so decoding from
+them shows that the information survives in token space — not that the model
+computed the statistic (CLS, the model's own summary, and per_token above its
+single-element ceiling are the model-side evidence). Two controls separate
+the contributions; run them with the existing tools:
+
+```bash
+python3 loader.py --metadata <stimuli>/metadata.json --n_bars <N> \
+    --model dinov2_vitb14@emb    --output features/<...>_emb.pt      # pre-block embeddings
+python3 loader.py --metadata <stimuli>/metadata.json --n_bars <N> \
+    --model dinov2_vitb14@random --output features/<...>_rand.pt     # untrained weights
+python3 probe.py --features features/<...>_emb.pt --target mean --n_bars <N>
+```
+
+`@emb` stores the patch embedding + positions (what enters block 1) as a
+single "layer"; `@random` keeps the architecture with untrained weights.
+probe.py handles any number of layers.
+
 ## Outlier discounting (discount mode)
 
 Displays hold N−1 group elements plus one outlier beyond the group's range
