@@ -657,8 +657,10 @@ class SizeGenerator(EnsembleGenerator):
 
     # v3: SD levels ×2.4 and larger shapes (circle/square only, means shifted up)
     # so the variance signal clears DINOv2's ≈0.5 px per-element size noise
-    # floor, which left v2's variance probes at chance (sub-pixel deviations)
-    NAME, ELEMENT, DOMAIN_TAG, VERSION = "size", "n_items", 3, "v3"
+    # floor, which left v2's variance probes at chance (sub-pixel deviations).
+    # v4: discount σ decoupled from SDS (see sds()) — v3's doubled SDS turned
+    # the group-range cap into 2.5σ, which a 31-element group cannot satisfy
+    NAME, ELEMENT, DOMAIN_TAG, VERSION = "size", "n_items", 3, "v4"
     BLOCK = 2                                     # 2×2-patch cells, 8×8 grid
     MEANS = [1790, 1940, 2090, 2240, 2390, 2540]  # ln(px)×1000: 5.99 … 12.68 px
     SDS = [60, 120, 180]                          # SD of ln(size) ×1000
@@ -705,6 +707,16 @@ class SizeGenerator(EnsembleGenerator):
 
     def stat_mean(self, mean):
         return mean / 1000                        # milli-ln codes → ln px
+
+    def sds(self, mode="standard"):
+        """Discount keeps v2's σ = 0.025 ln: the raised v3 STANDARD levels
+        exist to lift the variance signal over the pixel floor, which is
+        irrelevant to the discount paradigm — that needs a tight group.
+        0.025 restores ori's proportions (σ = level spacing / 6, range cap
+        MAX_GROUP_RANGE = 6σ, matching ori's 5° / 30°); with v3's σ = 0.06
+        the cap is 2.5σ and a 31-element group cannot satisfy it (N = 32
+        exhausted its resampling attempts)."""
+        return self.SDS if mode == "standard" else [25]
 
     def trial(self, n, mean, sd, rep, outlier=None):
         rng = self.rng(n, mean, sd, rep, *self.okey(outlier))   # draw order fixed
