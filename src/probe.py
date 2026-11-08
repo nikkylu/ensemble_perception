@@ -118,7 +118,7 @@ def split_statistics(H, train):
 
 
 def fit_predict(H, y, train, n_classes, lam, max_iter=1500, device="cpu",
-                max_params=4e7):
+                max_params=4e7, tag="fit"):
     """Solve one probe per (layer, split, λ) to convergence; logits for all rows.
 
     H (N, L, D), y (N,), train (N, S) 0/1 mask, lam broadcastable to (L, S, Q).
@@ -163,8 +163,13 @@ def fit_predict(H, y, train, n_classes, lam, max_iter=1500, device="cpu",
         g = (model.W.grad.pow(2).sum((-2, -1))
              + model.b.grad.pow(2).sum(-1)).sqrt()  # per-probe ‖∇‖ (L, S, Q)
         it = opt.state_dict()["state"][0]["n_iter"]
-        print(f"  L-BFGS: {it}/{max_iter} iters, max per-probe ‖∇‖ "
-              f"{g.max():.1e} over {g.numel()} probes")
+        # a cap-hit while sweeping the λ grid is expected (small-λ probes on
+        # near-separable data diverge); a cap-hit in the final fit at the
+        # SELECTED λ is a real convergence failure
+        flag = (" — WARNING: selected-λ fit unconverged, raise --max_iter"
+                if it >= max_iter and tag == "final" else "")
+        print(f"  L-BFGS[{tag}]: {it}/{max_iter} iters, max per-probe ‖∇‖ "
+              f"{g.max():.1e} over {g.numel()} probes{flag}")
         with torch.no_grad():
             out.append(model(H, mu, sd).cpu())
     return torch.cat(out, dim=3)
@@ -231,7 +236,7 @@ def nested_cv(H, y, n_classes, n_slices=1, rows_per_image=1, lambdas=(1e-2,),
         layers = (list(range(L)) if select == "layer"
                   else [s * per + ref for s in range(n_slices)])
         lg = fit_predict(H[:, layers], y_rows, rows(itr), n_classes,
-                         lambdas.view(1, 1, -1), **fit)
+                         lambdas.view(1, 1, -1), tag="λ-select", **fit)
         val = accuracy(lg, y_rows, rows(iva))                         # (·, F·k, Q)
         val = val.reshape(len(layers), n_folds, k, -1).mean(2)        # (·, F, Q)
         best = val.shape[-1] - 1 - val[..., ::-1].argmax(-1)          # ties → larger λ
@@ -239,7 +244,8 @@ def nested_cv(H, y, n_classes, n_slices=1, rows_per_image=1, lambdas=(1e-2,),
         if select == "slice":
             lam = lam.repeat_interleave(per, dim=0)                   # (L, F)
 
-    lg = fit_predict(H, y_rows, rows(tr), n_classes, lam.unsqueeze(-1), **fit)
+    lg = fit_predict(H, y_rows, rows(tr), n_classes, lam.unsqueeze(-1),
+                     tag="final", **fit)
     return lg[:, :, :, 0], te, lam.numpy()
 
 
@@ -444,7 +450,9 @@ def sweep(features, target, idx, n=None, per_token=False, bg_concat=False,
         pooled["pairwise_diff"] = compute_pairwise_diff(
             features["bar_concat"][idx], n, features["cls"].shape[-1])
     results = probe_slices(pooled, y, n_classes, **kw)
-    for st in ["bar_concat"] + (["bg_concat"] if bg_concat else []):
+    # bar_concat is probed by the closed-form regression only (REG_SLICES):
+    # its logistic version diverges at small λ (p >> n) and is retired
+    for st in (["bg_concat"] if bg_concat else []):
         if st in features:
             results.update(probe_slices({st: features[st][idx]}, y, n_classes, **kw))
     if per_token and "bar_concat" in features and n:
