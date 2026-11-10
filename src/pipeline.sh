@@ -7,7 +7,9 @@
 # For each (domain, mode): generate stimuli once, then per set size N
 #   verify patch masks → extract DINOv2 features → probe
 #   (discount sets also: discount.py — mean readout trained on the standard
-#    features of the same N, tested on the outlier displays; needs standard first).
+#    features of the same N, tested on the outlier displays; needs standard first;
+#    and discount_probe.py — local vs global readouts trained on the outlier
+#    displays themselves).
 #
 #   ./pipeline.sh                              # everything, seed 42, 200 reps
 #   ./pipeline.sh "ori hue" 7 50 "8 16"        # domains, seed, reps, set sizes
@@ -24,8 +26,10 @@
 #   stimuli_<domain>[_discount_<layout>]_s<seed>/
 #   features/<domain>_<mode>_n<N>_s<seed>.pt
 #   results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}         standard (plot_neurips.py input)
+#   results_s<seed>/<domain>/ideal.json                              chance / ceiling / single-token ceiling
 #   results_s<seed>/<domain>_<mode>/n<N>_mean_linear.{txt,json}      discount
 #   results_s<seed>/<domain>_<mode>/n<N>_discount.{txt,json}         outlier weight β
+#   results_s<seed>/<domain>_<mode>/n<N>_discount_probe.{txt,json}   local vs global
 set -e
 cd "$(dirname "$0")"
 
@@ -57,6 +61,11 @@ for DOMAIN in $DOMAINS; do
     echo "=== $DOMAIN / $MODE: generate (seed=$SEED reps=$REPS N=${NS[*]}) ==="
     python3 stimuli/generate.py $DOMAIN $GEN_ARGS --seed $SEED --n_reps $REPS \
         --set_sizes ${(j:,:)NS} --out $STIM
+    if [[ $MODE == standard ]]; then
+      echo "=== $DOMAIN / standard: ideal-observer reference levels ==="
+      python3 ideal.py $DOMAIN --seed $SEED --n_reps $REPS \
+          --set_sizes ${(j:,:)NS} --save $RES/ideal.json | tee $RES/ideal.txt
+    fi
 
     for N in $NS; do
       if [[ ! -d $STIM/n$(printf %02d $N) ]]; then
@@ -80,6 +89,11 @@ for DOMAIN in $DOMAINS; do
         echo "=== $DOMAIN / $MODE / N=$N: discount analysis ==="
         python3 discount.py --train $TRAIN --test $FEATS \
             --save $RES/n${N}_discount.json | tee $RES/n${N}_discount.txt
+      fi
+      if [[ $MODE != standard ]]; then
+        echo "=== $DOMAIN / $MODE / N=$N: local vs global probe ==="
+        python3 discount_probe.py --features $FEATS --seed $SEED \
+            --save $RES/n${N}_discount_probe.json | tee $RES/n${N}_discount_probe.txt
       fi
       # aggregation-vs-computation controls (standard sets only): pre-block
       # embeddings and one fixed untrained network (loader seeds @random)

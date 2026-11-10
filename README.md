@@ -20,7 +20,7 @@ src/
   readout.py           shared continuous ridge readout (circular / linear targets)
   discount.py          β: the outlier's weight in a standard-trained mean readout
   discount_probe.py    local vs global mean decodability on discount displays
-  ideal_single.py      single-element ideal-observer ceilings for per_token
+  ideal.py             task chance / ceiling / single-element ceiling (ideal observer)
   pipeline.sh          generate → verify → extract → probe → discount, all domains
 ```
 
@@ -43,7 +43,8 @@ seed and reruns byte-identically.
 | stimuli | `stimuli_<domain>[_discount_<layout>]_s<seed>/` |
 | features | `features/<domain>_<mode>_n<N>_s<seed>.pt` |
 | standard probes | `results_s<seed>/<domain>/n<N>_<target>_linear.{txt,json}` |
-| discount | `results_s<seed>/<domain>_<mode>/n<N>_{mean_linear,discount}.{txt,json}` |
+| ideal observer | `results_s<seed>/<domain>/ideal.{txt,json}` |
+| discount | `results_s<seed>/<domain>_<mode>/n<N>_{mean_linear,discount,discount_probe}.{txt,json}` |
 
 ## Probing protocol (probe.py)
 
@@ -55,7 +56,7 @@ seed and reruns byte-identically.
 - **Slices**: CLS, element tokens (pooled), background, all patches,
   pairwise_diff (token variance), and `per_token` — one shared probe scored
   on single element tokens. Its ceiling is not 1.0: compare against
-  `ideal_single.py` (above the ceiling ⇒ token mixing). The element-token
+  `ideal.py` single-element ceiling (above it ⇒ token mixing). The element-token
   *concat* probe is reported only as a closed-form regression (supplement):
   its logistic version confounds representation with p ≫ n estimation.
 - λ by nested CV (classification) or exact LOOCV (regression); outer test
