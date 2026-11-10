@@ -39,7 +39,7 @@ def diff(a, b, P):
 
 
 # ─────────────────────────────────────────────────────────────────
-# ridge readout with λ by cross-validation (SVD: all λ at once)
+# ridge readout with λ by cross-validation (one eigh: all λ at once)
 # ─────────────────────────────────────────────────────────────────
 
 def standardize(X, mu=None, sd=None):
@@ -49,10 +49,15 @@ def standardize(X, mu=None, sd=None):
 
 
 def ridge_all(X, Y, lambdas):
-    """Ridge weights for every λ (X, Y centered). → (Q, D, T)"""
-    U, s, Vt = np.linalg.svd(X, full_matrices=False)
-    UtY = U.T @ Y
-    return np.stack([Vt.T @ ((s / (s ** 2 + lam))[:, None] * UtY) for lam in lambdas])
+    """Ridge weights for every λ (X, Y centered). → (Q, D, T)
+    Eigendecomposition of the D×D Gram matrix XᵀX (rows ≫ D here). Must be
+    float64: squaring X squares its condition number, and in float32 the
+    eigenvalue error (~1e-7·‖X‖²) exceeds the smallest λ (1e-2)."""
+    X, Y = np.asarray(X, np.float64), np.asarray(Y, np.float64)
+    e, V = np.linalg.eigh(X.T @ X)
+    e = np.clip(e, 0.0, None)            # round-off can leave tiny negatives
+    VtXtY = V.T @ (X.T @ Y)
+    return np.stack([V @ (VtXtY / (e + lam)[:, None]) for lam in lambdas])
 
 
 def fit_readout(X, m, P, n_folds=5, seed=0, groups=None):
